@@ -1,0 +1,74 @@
+#pragma once
+
+#include <cuda_runtime.h>
+
+// ldmatrix: shared memory -> register load helpers for sm_120
+//
+// ldmatrix loads data from shared memory directly into the register
+// layout expected by mma.sync, avoiding manual data movement.
+// Each thread loads one 8x8 matrix fragment.
+
+namespace bk {
+
+// ============================================================
+// ldmatrix: load matrix fragments from shared memory to registers
+// ============================================================
+
+// Load 1 matrix (m8n8, 1x uint32_t per thread)
+__device__ __forceinline__ uint32_t ldmatrix_x1(const void *smem_ptr)
+{
+    uint32_t reg;
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];\n"
+        : "=r"(reg)
+        : "r"(addr));
+    return reg;
+}
+
+// Load 2 matrices (m8n8 x2, 2x uint32_t per thread)
+__device__ __forceinline__ void ldmatrix_x2(uint32_t &r0, uint32_t &r1, const void *smem_ptr)
+{
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+        : "=r"(r0), "=r"(r1)
+        : "r"(addr));
+}
+
+// Load 4 matrices (m8n8 x4, 4x uint32_t per thread)
+// This is the most common variant for BF16 mma.sync (loads A fragment)
+__device__ __forceinline__ void ldmatrix_x4(
+    uint32_t &r0, uint32_t &r1, uint32_t &r2, uint32_t &r3,
+    const void *smem_ptr)
+{
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+        : "r"(addr));
+}
+
+// Load 4 matrices transposed (for B matrix in col-major layout)
+__device__ __forceinline__ void ldmatrix_x4_trans(
+    uint32_t &r0, uint32_t &r1, uint32_t &r2, uint32_t &r3,
+    const void *smem_ptr)
+{
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+        : "r"(addr));
+}
+
+// Load 2 matrices transposed
+__device__ __forceinline__ void ldmatrix_x2_trans(uint32_t &r0, uint32_t &r1, const void *smem_ptr)
+{
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
+        : "=r"(r0), "=r"(r1)
+        : "r"(addr));
+}
+
+} // namespace bk
