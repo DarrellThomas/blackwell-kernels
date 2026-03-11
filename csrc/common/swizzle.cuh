@@ -21,20 +21,26 @@ namespace bk {
 // XOR swizzle: remap shared memory address to avoid bank conflicts
 // ============================================================
 
-// Swizzle for 128-bit (16-byte) access pattern
-// row, col are in units of elements (e.g., BF16 values)
-// Returns byte offset into shared memory
+// Returns element index into unpadded BF16 shared memory array.
+// XOR-swizzles 8-element (16-byte) chunks to eliminate bank conflicts.
+// COLS must be a power of 2 and a multiple of 8.
+//
+// The swizzle operates on chunk indices (col >> 3). For a given row,
+// chunks are permuted by XOR with (row & SWIZZLE_MASK). This ensures
+// that the same logical column maps to different physical banks across
+// rows: bank_group = ((col>>3) ^ (row & MASK)) % 8.
+//
+// With MASK=7 (COLS >= 64), 8 consecutive rows produce 8 unique bank
+// groups — zero conflicts for any column access pattern.
 template <int COLS>
-__device__ __forceinline__ int swizzle_offset(int row, int col)
+__device__ __forceinline__ int swizzle_idx(int row, int col)
 {
-    // Each bank is 4 bytes. 32 banks = 128 bytes per bank cycle.
-    // For BF16 (2 bytes/element), 8 elements per bank cycle row.
-    // XOR the row with (col / 8) to permute bank assignment.
-    constexpr int ELEMS_PER_BANK = 8; // 16 bytes / 2 bytes per BF16
-    int swizzled_col = col ^ ((row % ELEMS_PER_BANK) * (COLS / ELEMS_PER_BANK));
-    // Clamp to valid range
-    swizzled_col = swizzled_col % COLS;
-    return (row * COLS + swizzled_col) * sizeof(__nv_bfloat16);
+    constexpr int NUM_CHUNKS = COLS / 8;
+    constexpr int SWIZZLE_BITS = (NUM_CHUNKS >= 8) ? 3 :
+                                  (NUM_CHUNKS >= 4) ? 2 : 1;
+    constexpr int SWIZZLE_MASK = (1 << SWIZZLE_BITS) - 1;
+    int swizzled_col = col ^ ((row & SWIZZLE_MASK) << 3);
+    return row * COLS + swizzled_col;
 }
 
 // Simple padding-based conflict avoidance
