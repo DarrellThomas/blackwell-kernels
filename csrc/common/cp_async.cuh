@@ -50,6 +50,23 @@ __device__ __forceinline__ void cp_async_128_pred(void *dst_smem, const void *sr
         : "r"(dst), "l"(src_gmem), "r"((int)pred));
 }
 
+// Copy 16 bytes with predicate; zero-fills destination when pred is false
+__device__ __forceinline__ void cp_async_128_zfill(void *dst_smem, const void *src_gmem, bool pred)
+{
+    uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(dst_smem));
+    asm volatile(
+        "{\n"
+        "  .reg .pred p;\n"
+        "  .reg .u32 z;\n"
+        "  setp.ne.b32 p, %2, 0;\n"
+        "  mov.u32 z, 0;\n"
+        "  @p cp.async.cg.shared.global [%0], [%1], 16;\n"
+        "  @!p st.shared.v4.u32 [%0], {z, z, z, z};\n"
+        "}\n"
+        :
+        : "r"(dst), "l"(src_gmem), "r"((int)pred));
+}
+
 // ============================================================
 // cp.async barriers
 // ============================================================

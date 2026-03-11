@@ -6,6 +6,12 @@ dist/
 *.o
 *.a
 
+# Compiled test binaries (no extension)
+tests/test_ldmatrix
+tests/test_mma
+tests/test_mma[0-9]*
+tests/test_mma_pure
+
 # Python
 __pycache__/
 *.pyc

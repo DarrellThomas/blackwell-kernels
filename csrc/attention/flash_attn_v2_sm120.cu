@@ -94,20 +94,23 @@ flash_attn_v2_kernel(
     __nv_bfloat16 *smem_P = smem_Q;
 
     // ================================================================
-    // Phase A: Load Q tile global → shared memory
+    // Phase A: Load Q tile global → shared memory via cp.async
     // ================================================================
     {
-        const int total_q_elems = V2_BLOCK_Q * HEAD_DIM;
-        for (int i = tid; i < total_q_elems; i += V2_THREADS) {
-            int row = i / HEAD_DIM;
-            int col = i % HEAD_DIM;
+        constexpr int CHUNKS_PER_ROW = HEAD_DIM / 8;  // 16B = 8 bf16
+        constexpr int TOTAL_CHUNKS = V2_BLOCK_Q * CHUNKS_PER_ROW;
+        for (int i = tid; i < TOTAL_CHUNKS; i += V2_THREADS) {
+            int row = i / CHUNKS_PER_ROW;
+            int col = (i % CHUNKS_PER_ROW) * 8;
             int global_row = q_start + row;
-            __nv_bfloat16 val = (global_row < seq_len)
-                ? Q_bh[global_row * HEAD_DIM + col]
-                : __float2bfloat16(0.0f);
-            smem_Q[row * STRIDE_D + col] = val;
+            bk::cp_async_128_zfill(
+                &smem_Q[row * STRIDE_D + col],
+                &Q_bh[global_row * HEAD_DIM + col],
+                global_row < seq_len);
         }
     }
+    bk::cp_async_commit();
+    bk::cp_async_wait<0>();
     __syncthreads();
 
     // ================================================================
@@ -173,20 +176,23 @@ flash_attn_v2_kernel(
         int kv_start = kv_block * V2_BLOCK_KV;
 
         // ============================================================
-        // D.1: Load K tile → smem_K
+        // D.1: Load K tile → smem_K via cp.async
         // ============================================================
         {
-            const int total = V2_BLOCK_KV * HEAD_DIM;
-            for (int i = tid; i < total; i += V2_THREADS) {
-                int row = i / HEAD_DIM;
-                int col = i % HEAD_DIM;
+            constexpr int CHUNKS_PER_ROW = HEAD_DIM / 8;
+            constexpr int TOTAL_CHUNKS = V2_BLOCK_KV * CHUNKS_PER_ROW;
+            for (int i = tid; i < TOTAL_CHUNKS; i += V2_THREADS) {
+                int row = i / CHUNKS_PER_ROW;
+                int col = (i % CHUNKS_PER_ROW) * 8;
                 int gkv = kv_start + row;
-                __nv_bfloat16 val = (gkv < seq_len)
-                    ? K_bh[gkv * HEAD_DIM + col]
-                    : __float2bfloat16(0.0f);
-                smem_K[row * STRIDE_D + col] = val;
+                bk::cp_async_128_zfill(
+                    &smem_K[row * STRIDE_D + col],
+                    &K_bh[gkv * HEAD_DIM + col],
+                    gkv < seq_len);
             }
         }
+        bk::cp_async_commit();
+        bk::cp_async_wait<0>();
         __syncthreads();
 
         // ============================================================
@@ -352,19 +358,22 @@ flash_attn_v2_kernel(
             }
         }
 
-        // Load V tile → smem_V (different smem region, can happen in parallel)
+        // Load V tile → smem_V via cp.async
         {
-            const int total = V2_BLOCK_KV * HEAD_DIM;
-            for (int i = tid; i < total; i += V2_THREADS) {
-                int row = i / HEAD_DIM;
-                int col = i % HEAD_DIM;
+            constexpr int CHUNKS_PER_ROW = HEAD_DIM / 8;
+            constexpr int TOTAL_CHUNKS = V2_BLOCK_KV * CHUNKS_PER_ROW;
+            for (int i = tid; i < TOTAL_CHUNKS; i += V2_THREADS) {
+                int row = i / CHUNKS_PER_ROW;
+                int col = (i % CHUNKS_PER_ROW) * 8;
                 int gkv = kv_start + row;
-                __nv_bfloat16 val = (gkv < seq_len)
-                    ? V_bh[gkv * HEAD_DIM + col]
-                    : __float2bfloat16(0.0f);
-                smem_V[row * STRIDE_D + col] = val;
+                bk::cp_async_128_zfill(
+                    &smem_V[row * STRIDE_D + col],
+                    &V_bh[gkv * HEAD_DIM + col],
+                    gkv < seq_len);
             }
         }
+        bk::cp_async_commit();
+        bk::cp_async_wait<0>();
         __syncthreads();
 
         // ============================================================
