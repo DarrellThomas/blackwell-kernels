@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Darrell Thomas. MIT License. See LICENSE file.
+
 #include <torch/extension.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

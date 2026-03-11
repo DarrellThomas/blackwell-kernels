@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Darrell Thomas. MIT License. See LICENSE file.
+
 #pragma once
 
 #include <cuda_bf16.h>

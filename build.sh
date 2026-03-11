@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Darrell Thomas. MIT License. See LICENSE file.
 # Build blackwell_kernels PyTorch extension
 # PyTorch is compiled against CUDA 13.0; use the matching toolkit.
 set -euo pipefail

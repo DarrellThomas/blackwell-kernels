@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Darrell Thomas. MIT License. See LICENSE file.
+
 import os
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -15,6 +17,7 @@ setup(
             "blackwell_kernels._C",
             [
                 os.path.join(ROOT, "csrc/attention/flash_attn_sm120.cu"),
+                os.path.join(ROOT, "csrc/attention/flash_attn_v2_sm120.cu"),
                 os.path.join(ROOT, "csrc/gemm/bf16_gemm_sm120.cu"),
             ],
             extra_compile_args={

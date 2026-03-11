@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Darrell Thomas. MIT License. See LICENSE file.
+//
 // Smoke test: verify mma.sync.aligned.m16n8k16 compiles and runs on sm_120.
 // This validates that the toolchain is correctly configured.
 //

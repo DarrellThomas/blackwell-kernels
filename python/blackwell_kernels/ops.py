@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Darrell Thomas. MIT License. See LICENSE file.
+
 """General-purpose kernel operations for sm_120."""
 
 import torch

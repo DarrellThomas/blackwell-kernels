@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Darrell Thomas. MIT License. See LICENSE file.
+
 cmake_minimum_required(VERSION 3.24)
 project(blackwell_kernels LANGUAGES CXX CUDA)
 
@@ -17,8 +19,10 @@ target_compile_options(bf16_gemm PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math --expt-relaxed-constexpr -lineinfo>
 )
 
-# Flash Attention kernel
-add_library(flash_attn STATIC csrc/attention/flash_attn_sm120.cu)
+# Flash Attention kernel (v1 + v2)
+add_library(flash_attn STATIC
+    csrc/attention/flash_attn_sm120.cu
+    csrc/attention/flash_attn_v2_sm120.cu)
 target_compile_options(flash_attn PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math --expt-relaxed-constexpr -lineinfo>
 )

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Darrell Thomas. MIT License. See LICENSE file.
+
 """Test BF16 GEMM kernel against PyTorch reference."""
 
 import torch

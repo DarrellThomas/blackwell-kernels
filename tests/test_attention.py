@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Darrell Thomas. MIT License. See LICENSE file.
+
 """Test flash attention kernel against PyTorch reference."""
 
 import torch
@@ -58,6 +60,97 @@ def test_flash_attn_causal():
     print("PASS: flash_attn causal")
 
 
+def test_flash_attn_v2_correctness():
+    """Compare v2 (MMA) kernel output against PyTorch reference."""
+    torch.manual_seed(42)
+    B, H, N, D = 2, 8, 128, 64
+    device = "cuda:0"
+
+    Q = torch.randn(B, H, N, D, device=device, dtype=torch.bfloat16)
+    K = torch.randn(B, H, N, D, device=device, dtype=torch.bfloat16)
+    V = torch.randn(B, H, N, D, device=device, dtype=torch.bfloat16)
+    scale = D**-0.5
+
+    ref = reference_attention(Q.float(), K.float(), V.float(), scale).bfloat16()
+
+    from blackwell_kernels import flash_attn_v2_sm120
+
+    out = flash_attn_v2_sm120(Q, K, V, causal=False, scale=scale)
+
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+    print("PASS: flash_attn_v2 non-causal")
+
+
+def test_flash_attn_v2_causal():
+    """Test v2 (MMA) kernel with causal masking."""
+    torch.manual_seed(42)
+    B, H, N, D = 2, 8, 128, 64
+    device = "cuda:0"
+
+    Q = torch.randn(B, H, N, D, device=device, dtype=torch.bfloat16)
+    K = torch.randn(B, H, N, D, device=device, dtype=torch.bfloat16)
+    V = torch.randn(B, H, N, D, device=device, dtype=torch.bfloat16)
+    scale = D**-0.5
+
+    ref = reference_attention(Q.float(), K.float(), V.float(), scale, causal=True).bfloat16()
+
+    from blackwell_kernels import flash_attn_v2_sm120
+
+    out = flash_attn_v2_sm120(Q, K, V, causal=True, scale=scale)
+
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+    print("PASS: flash_attn_v2 causal")
+
+
+def test_flash_attn_v2_d128():
+    """Test v2 kernel with HEAD_DIM=128."""
+    torch.manual_seed(42)
+    B, H, N, D = 2, 8, 128, 128
+    device = "cuda:0"
+
+    Q = torch.randn(B, H, N, D, device=device, dtype=torch.bfloat16)
+    K = torch.randn(B, H, N, D, device=device, dtype=torch.bfloat16)
+    V = torch.randn(B, H, N, D, device=device, dtype=torch.bfloat16)
+    scale = D**-0.5
+
+    ref = reference_attention(Q.float(), K.float(), V.float(), scale).bfloat16()
+
+    from blackwell_kernels import flash_attn_v2_sm120
+
+    out = flash_attn_v2_sm120(Q, K, V, causal=False, scale=scale)
+
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+    print("PASS: flash_attn_v2 D=128 non-causal")
+
+
+def test_flash_attn_v2_long_seq():
+    """Test v2 kernel with longer sequences (multiple Q blocks)."""
+    torch.manual_seed(42)
+    B, H, N, D = 1, 4, 2048, 64
+    device = "cuda:0"
+
+    Q = torch.randn(B, H, N, D, device=device, dtype=torch.bfloat16)
+    K = torch.randn(B, H, N, D, device=device, dtype=torch.bfloat16)
+    V = torch.randn(B, H, N, D, device=device, dtype=torch.bfloat16)
+    scale = D**-0.5
+
+    ref = reference_attention(Q.float(), K.float(), V.float(), scale, causal=True).bfloat16()
+
+    from blackwell_kernels import flash_attn_v2_sm120
+
+    out = flash_attn_v2_sm120(Q, K, V, causal=True, scale=scale)
+
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+    print("PASS: flash_attn_v2 N=2048 causal")
+
+
 if __name__ == "__main__":
+    # v1 tests
     test_flash_attn_correctness()
     test_flash_attn_causal()
+
+    # v2 tests
+    test_flash_attn_v2_correctness()
+    test_flash_attn_v2_causal()
+    test_flash_attn_v2_d128()
+    test_flash_attn_v2_long_seq()

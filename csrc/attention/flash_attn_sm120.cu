@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Darrell Thomas. MIT License. See LICENSE file.
+
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
@@ -278,10 +280,19 @@ torch::Tensor flash_attn_forward(
     return O.reshape({B, H, N, D});
 }
 
+// Declared in flash_attn_v2_sm120.cu
+torch::Tensor flash_attn_v2_forward(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V,
+    float scale, bool causal);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("flash_attn_forward", &flash_attn_forward,
-          "Flash Attention forward (sm_120 optimized)",
+          "Flash Attention forward v1 (sm_120, scalar FP32)",
+          py::arg("Q"), py::arg("K"), py::arg("V"),
+          py::arg("scale"), py::arg("causal") = false);
+    m.def("flash_attn_v2_forward", &flash_attn_v2_forward,
+          "Flash Attention forward v2 (sm_120, MMA tensor cores)",
           py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("scale"), py::arg("causal") = false);
 }
