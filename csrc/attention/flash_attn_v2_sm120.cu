@@ -72,7 +72,7 @@ flash_attn_v2_kernel(
     __nv_bfloat16 *O_bh = O + bh_idx * seq_len * HEAD_DIM;
     float *L_bh = L + bh_idx * seq_len;
 
-    // ---- Shared memory layout ----
+    // ---- Shared memory layout (double-buffered K/V) ----
     // STRIDE_D: padded row width for Q/K/V tiles (HEAD_DIM + PAD)
     // STRIDE_KV: padded row width for P tile (BLOCK_KV + PAD)
     constexpr int STRIDE_D = HEAD_DIM + V2_PAD;
@@ -80,18 +80,16 @@ flash_attn_v2_kernel(
 
     constexpr int Q_SMEM_ELEMS = V2_BLOCK_Q * STRIDE_D;
     constexpr int KV_SMEM_ELEMS = V2_BLOCK_KV * STRIDE_D;
-    // P reuses smem_Q region (Q is in registers by then)
-    // P needs BLOCK_Q * STRIDE_KV = 64 * 72 = 4608 elements
-    // smem_Q has BLOCK_Q * STRIDE_D elements (≥ 4608 for D ≥ 64)
-    // For D=32: smem_Q = 64*40 = 2560 < 4608, so P will also extend into smem_K
-    // That's fine because K is also no longer needed when P is written.
+    // P reuses Q region. QP must hold whichever is larger (P > Q for D=32).
+    constexpr int P_SMEM_ELEMS = V2_BLOCK_Q * STRIDE_KV;
+    constexpr int QP_SMEM_ELEMS = (Q_SMEM_ELEMS > P_SMEM_ELEMS) ? Q_SMEM_ELEMS : P_SMEM_ELEMS;
 
+    // Layout: [Q/P: QP_SMEM_ELEMS] [K0: KV] [K1: KV] [V0: KV] [V1: KV]
     extern __shared__ char smem_raw[];
-    __nv_bfloat16 *smem_Q = reinterpret_cast<__nv_bfloat16 *>(smem_raw);
-    __nv_bfloat16 *smem_K = smem_Q + Q_SMEM_ELEMS;
-    __nv_bfloat16 *smem_V = smem_K + KV_SMEM_ELEMS;
-    // P will be written starting at smem_Q with STRIDE_KV per row
-    __nv_bfloat16 *smem_P = smem_Q;
+    __nv_bfloat16 *smem_QP = reinterpret_cast<__nv_bfloat16 *>(smem_raw);
+    __nv_bfloat16 *smem_K_base = smem_QP + QP_SMEM_ELEMS;
+    __nv_bfloat16 *smem_V_base = smem_K_base + 2 * KV_SMEM_ELEMS;
+    __nv_bfloat16 *smem_P = smem_QP;  // P reuses Q/P region
 
     // ================================================================
     // Phase A: Load Q tile global → shared memory via cp.async
@@ -104,7 +102,7 @@ flash_attn_v2_kernel(
             int col = (i % CHUNKS_PER_ROW) * 8;
             int global_row = q_start + row;
             bk::cp_async_128_zfill(
-                &smem_Q[row * STRIDE_D + col],
+                &smem_QP[row * STRIDE_D + col],
                 &Q_bh[global_row * HEAD_DIM + col],
                 global_row < seq_len);
         }
@@ -132,7 +130,7 @@ flash_attn_v2_kernel(
         for (int dc = 0; dc < D_CHUNKS; dc++) {
             int smem_row = warp_q_off + (sub / 2) * 8 + t_in_sub;
             int smem_col = dc * 16 + (sub % 2) * 8;
-            const void *addr = &smem_Q[smem_row * STRIDE_D + smem_col];
+            const void *addr = &smem_QP[smem_row * STRIDE_D + smem_col];
             bk::ldmatrix_x4(Q_rmem[dc][0], Q_rmem[dc][1],
                             Q_rmem[dc][2], Q_rmem[dc][3], addr);
         }
@@ -172,34 +170,67 @@ flash_attn_v2_kernel(
     constexpr int S_N_CHUNKS = V2_BLOCK_KV / 8;   // 8
     constexpr int P_K_CHUNKS = V2_BLOCK_KV / 16;   // 4
 
+    // ================================================================
+    // Prologue: Load first K/V tile into double-buffer slot 0
+    // ================================================================
+    {
+        __nv_bfloat16 *smem_K0 = smem_K_base;
+        __nv_bfloat16 *smem_V0 = smem_V_base;
+        constexpr int CHUNKS_PER_ROW = HEAD_DIM / 8;
+        constexpr int TOTAL_CHUNKS = V2_BLOCK_KV * CHUNKS_PER_ROW;
+        for (int i = tid; i < TOTAL_CHUNKS; i += V2_THREADS) {
+            int row = i / CHUNKS_PER_ROW;
+            int col = (i % CHUNKS_PER_ROW) * 8;
+            int gkv = row;
+            bk::cp_async_128_zfill(
+                &smem_K0[row * STRIDE_D + col],
+                &K_bh[gkv * HEAD_DIM + col],
+                gkv < seq_len);
+            bk::cp_async_128_zfill(
+                &smem_V0[row * STRIDE_D + col],
+                &V_bh[gkv * HEAD_DIM + col],
+                gkv < seq_len);
+        }
+    }
+    bk::cp_async_commit();
+    bk::cp_async_wait<0>();
+    __syncthreads();
+
     for (int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
         int kv_start = kv_block * V2_BLOCK_KV;
+        int cur = kv_block & 1;
+        __nv_bfloat16 *smem_K_cur = smem_K_base + cur * KV_SMEM_ELEMS;
+        __nv_bfloat16 *smem_V_cur = smem_V_base + cur * KV_SMEM_ELEMS;
 
         // ============================================================
-        // D.1: Load K tile → smem_K via cp.async
+        // Prefetch next K/V tile into alternate buffer (overlaps compute)
         // ============================================================
-        {
+        if (kv_block + 1 < num_kv_blocks) {
+            int nxt = 1 - cur;
+            int kv_start_nxt = (kv_block + 1) * V2_BLOCK_KV;
+            __nv_bfloat16 *smem_K_nxt = smem_K_base + nxt * KV_SMEM_ELEMS;
+            __nv_bfloat16 *smem_V_nxt = smem_V_base + nxt * KV_SMEM_ELEMS;
             constexpr int CHUNKS_PER_ROW = HEAD_DIM / 8;
             constexpr int TOTAL_CHUNKS = V2_BLOCK_KV * CHUNKS_PER_ROW;
             for (int i = tid; i < TOTAL_CHUNKS; i += V2_THREADS) {
                 int row = i / CHUNKS_PER_ROW;
                 int col = (i % CHUNKS_PER_ROW) * 8;
-                int gkv = kv_start + row;
+                int gkv = kv_start_nxt + row;
                 bk::cp_async_128_zfill(
-                    &smem_K[row * STRIDE_D + col],
+                    &smem_K_nxt[row * STRIDE_D + col],
                     &K_bh[gkv * HEAD_DIM + col],
+                    gkv < seq_len);
+                bk::cp_async_128_zfill(
+                    &smem_V_nxt[row * STRIDE_D + col],
+                    &V_bh[gkv * HEAD_DIM + col],
                     gkv < seq_len);
             }
         }
         bk::cp_async_commit();
-        bk::cp_async_wait<0>();
-        __syncthreads();
 
         // ============================================================
         // D.2: Compute S = Q * K^T using MMA
         // ============================================================
-        // S is [16 x BLOCK_KV] per warp = m16 x (S_N_CHUNKS * n8)
-        // with D_CHUNKS k-reduction steps.
         float S_rmem[S_N_CHUNKS][4];
         #pragma unroll
         for (int n = 0; n < S_N_CHUNKS; n++) {
@@ -207,34 +238,19 @@ flash_attn_v2_kernel(
             S_rmem[n][2] = 0.0f; S_rmem[n][3] = 0.0f;
         }
 
-        // d_chunk outer (reduction), n_chunk inner (output cols)
         #pragma unroll
         for (int dc = 0; dc < D_CHUNKS; dc++) {
             #pragma unroll
             for (int nc = 0; nc < S_N_CHUNKS; nc++) {
-                // Load K^T B-fragment (k16 x n8) manually.
-                // MMA B-fragment for m16n8k16: thread T holds
-                //   b0 = {B_col[k0,n], B_col[k1,n]} with k0=(T%4)*2, n=T/4
-                //   b1 = {B_col[k0+8,n], B_col[k1+8,n]}
-                // We need B_col[k,n] = K^T[k,n] = K[n,k], so:
-                //   b0 = {K[n, k0], K[n, k1]} — 2 consecutive d-elements in one K row
-                //   b1 = {K[n, k0+8], K[n, k1+8]}
-                // n = kv index, k = d index within this dc chunk.
-                int kv_idx = nc * 8 + lane_id / 4;           // n = T/4 (0..7)
-                int d_base = dc * 16 + (lane_id % 4) * 2;    // k0 = (T%4)*2
+                int kv_idx = nc * 8 + lane_id / 4;
+                int d_base = dc * 16 + (lane_id % 4) * 2;
 
                 uint32_t K_rmem0, K_rmem1;
-                // Load 2 consecutive bf16 as uint32 (k0, k1)
                 K_rmem0 = *reinterpret_cast<const uint32_t*>(
-                    &smem_K[kv_idx * STRIDE_D + d_base]);
-                // Load (k0+8, k1+8)
+                    &smem_K_cur[kv_idx * STRIDE_D + d_base]);
                 K_rmem1 = *reinterpret_cast<const uint32_t*>(
-                    &smem_K[kv_idx * STRIDE_D + d_base + 8]);
+                    &smem_K_cur[kv_idx * STRIDE_D + d_base + 8]);
 
-                // NOTE: ldmatrix_x4 outputs a1↔a2 swapped relative to MMA order.
-                // ldmatrix gives: [0]=m0k0, [1]=m0k1, [2]=m1k0, [3]=m1k1
-                // MMA expects:    a0=m0k0,  a1=m1k0,  a2=m0k1,  a3=m1k1
-                // So pass [0],[2],[1],[3] to the MMA.
                 bk::mma_m16n8k16_bf16(
                     S_rmem[nc][0], S_rmem[nc][1],
                     S_rmem[nc][2], S_rmem[nc][3],
@@ -265,7 +281,6 @@ flash_attn_v2_kernel(
                 if (col0 > global_row1) S_rmem[nc][2] = -FLT_MAX;
                 if (col1 > global_row1) S_rmem[nc][3] = -FLT_MAX;
             }
-            // Out-of-bounds KV
             if (col0 >= seq_len) { S_rmem[nc][0] = -FLT_MAX; S_rmem[nc][2] = -FLT_MAX; }
             if (col1 >= seq_len) { S_rmem[nc][1] = -FLT_MAX; S_rmem[nc][3] = -FLT_MAX; }
         }
@@ -280,7 +295,6 @@ flash_attn_v2_kernel(
             this_max[1] = fmaxf(this_max[1], fmaxf(S_rmem[nc][2], S_rmem[nc][3]));
         }
 
-        // Reduce max across 4-thread groups sharing a row (XOR 1, 2)
         this_max[0] = fmaxf(this_max[0], __shfl_xor_sync(0xffffffff, this_max[0], 1));
         this_max[0] = fmaxf(this_max[0], __shfl_xor_sync(0xffffffff, this_max[0], 2));
         this_max[1] = fmaxf(this_max[1], __shfl_xor_sync(0xffffffff, this_max[1], 1));
@@ -301,7 +315,6 @@ flash_attn_v2_kernel(
         row_sum[0] *= rescale[0];
         row_sum[1] *= rescale[1];
 
-        // exp(S - max)
         #pragma unroll
         for (int nc = 0; nc < S_N_CHUNKS; nc++) {
             S_rmem[nc][0] = (S_rmem[nc][0] == -FLT_MAX) ? 0.0f : __expf(S_rmem[nc][0] - new_max[0]);
@@ -310,7 +323,6 @@ flash_attn_v2_kernel(
             S_rmem[nc][3] = (S_rmem[nc][3] == -FLT_MAX) ? 0.0f : __expf(S_rmem[nc][3] - new_max[1]);
         }
 
-        // Accumulate row_sum
         float local_sum[2] = {0.0f, 0.0f};
         #pragma unroll
         for (int nc = 0; nc < S_N_CHUNKS; nc++) {
@@ -328,23 +340,14 @@ flash_attn_v2_kernel(
         row_max[1] = new_max[1];
 
         // ============================================================
-        // D.5: Write P to shared memory + load V
+        // D.5: Write P to shared memory
         // ============================================================
-        // S→P: the MMA accumulator (d0..d3) and A-fragment (a0..a3) have
-        // DIFFERENT thread-to-element mappings:
-        //   Accumulator: row = lane_id/4,    col = (lane_id%4)*2
-        //   A-fragment:  row = lane_id%8,    col = (lane_id/8)*2
-        // So we must write P to shared memory in row-major layout, then
-        // reload it via ldmatrix_x4 to get the correct A-fragment.
-        //
-        // We reuse smem_Q for P (Q is already in registers).
-        // P has BLOCK_Q rows x BLOCK_KV cols, stride = STRIDE_KV.
-        __syncthreads();  // ensure K reads are done
-
-        // Write P (softmax output) to smem_P, converting to BF16
+        // V already in smem_V_cur from prologue/prefetch.
+        // P writes to smem_P (= smem_QP), separate from K/V buffers.
+        // Each warp writes only its own 16 rows — no cross-warp conflict.
         {
-            int local_row0 = warp_id * V2_WARP_Q + (lane_id / 4);      // 0..7 within warp chunk
-            int local_row1 = local_row0 + 8;                             // 8..15
+            int local_row0 = warp_id * V2_WARP_Q + (lane_id / 4);
+            int local_row1 = local_row0 + 8;
 
             #pragma unroll
             for (int nc = 0; nc < S_N_CHUNKS; nc++) {
@@ -358,32 +361,12 @@ flash_attn_v2_kernel(
             }
         }
 
-        // Load V tile → smem_V via cp.async
-        {
-            constexpr int CHUNKS_PER_ROW = HEAD_DIM / 8;
-            constexpr int TOTAL_CHUNKS = V2_BLOCK_KV * CHUNKS_PER_ROW;
-            for (int i = tid; i < TOTAL_CHUNKS; i += V2_THREADS) {
-                int row = i / CHUNKS_PER_ROW;
-                int col = (i % CHUNKS_PER_ROW) * 8;
-                int gkv = kv_start + row;
-                bk::cp_async_128_zfill(
-                    &smem_V[row * STRIDE_D + col],
-                    &V_bh[gkv * HEAD_DIM + col],
-                    gkv < seq_len);
-            }
-        }
-        bk::cp_async_commit();
-        bk::cp_async_wait<0>();
-        __syncthreads();
-
         // ============================================================
         // D.6: Load P via ldmatrix_x4, compute O += P * V via MMA
         // ============================================================
-        // Load P A-fragments from smem_P (same ldmatrix pattern as Q)
         uint32_t P_rmem[P_K_CHUNKS][4];
         {
             int warp_p_off = warp_id * V2_WARP_Q;
-            // Same ldmatrix.x4 sub-matrix mapping as Q loading
             int p_sub = lane_id / 8;
             int p_t_in_sub = lane_id % 8;
             #pragma unroll
@@ -396,25 +379,17 @@ flash_attn_v2_kernel(
             }
         }
 
-        // O += P * V
         #pragma unroll
         for (int nc = 0; nc < O_N_CHUNKS; nc++) {
             #pragma unroll
             for (int kc = 0; kc < P_K_CHUNKS; kc++) {
-                // Load V B-fragment (k16 x n8) via ldmatrix_x2_trans
-                // V is [BLOCK_KV, D] row-major, stride = STRIDE_D
-                // For P*V: k = kv-dimension, n = d-dimension
-                //   Tile 0 (k[0:8]): threads 0-7, V[kc*16+t, nc*8..nc*8+7]
-                //   Tile 1 (k[8:16]): threads 8-15, V[kc*16+8+t, nc*8..nc*8+7]
-                //   Both tiles read the SAME 8 d-columns but different kv-rows
                 int v_row = kc * 16 + (lane_id % 8) + ((lane_id / 8) % 2) * 8;
                 int v_col = nc * 8;
-                const void *addr_v = &smem_V[v_row * STRIDE_D + v_col];
+                const void *addr_v = &smem_V_cur[v_row * STRIDE_D + v_col];
 
                 uint32_t V_rmem0, V_rmem1;
                 bk::ldmatrix_x2_trans(V_rmem0, V_rmem1, addr_v);
 
-                // Same a1↔a2 swap for P-fragment from ldmatrix_x4
                 bk::mma_m16n8k16_bf16(
                     O_rmem[nc][0], O_rmem[nc][1],
                     O_rmem[nc][2], O_rmem[nc][3],
@@ -426,6 +401,9 @@ flash_attn_v2_kernel(
             }
         }
 
+        // Single sync: ensures D.6 reads complete before next P write,
+        // and prefetch data is visible for next iteration
+        bk::cp_async_wait<0>();
         __syncthreads();
     } // end KV loop
 
@@ -493,14 +471,15 @@ void flash_attn_v2_fwd(
     dim3 grid(num_q_blocks, bh);
     dim3 block(V2_THREADS);
 
-    // Shared memory: Q + K + V tiles (padded), P reuses Q region
-    // Q: BLOCK_Q * STRIDE_D, K: BLOCK_KV * STRIDE_D, V: BLOCK_KV * STRIDE_D
-    // P (reusing Q+K space): BLOCK_Q * STRIDE_KV — must fit in Q+K region
-    // We allocate Q+K+V and verify P fits in Q+K.
+    // Shared memory: [Q/P] [K0] [K1] [V0] [V1] — double-buffered K/V
     auto compute_smem = [](int hd) {
         int stride_d = hd + V2_PAD;
-        return (V2_BLOCK_Q * stride_d + 2 * V2_BLOCK_KV * stride_d)
-               * (int)sizeof(__nv_bfloat16);
+        int stride_kv = V2_BLOCK_KV + V2_PAD;
+        int q_elems = V2_BLOCK_Q * stride_d;
+        int p_elems = V2_BLOCK_Q * stride_kv;
+        int qp_elems = (q_elems > p_elems) ? q_elems : p_elems;
+        int kv_elems = V2_BLOCK_KV * stride_d;
+        return (qp_elems + 4 * kv_elems) * (int)sizeof(__nv_bfloat16);
     };
     int smem_bytes = compute_smem(head_dim);
 
