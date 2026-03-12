@@ -240,14 +240,15 @@ flash_attn_v2_kernel(
         for (int dc = 0; dc < D_CHUNKS; dc++) {
             #pragma unroll
             for (int nc = 0; nc < S_N_CHUNKS; nc++) {
-                int kv_idx = nc * 8 + lane_id / 4;
-                int d_base = dc * 16 + (lane_id % 4) * 2;
+                // ldmatrix_x2: warp-cooperative load of B fragment for Q*K^T
+                // Threads 0-7→matrix0 (cols 0-7), 8-15→matrix1 (cols 8-15),
+                // 16-23/24-31 mirror 0-7/8-15.
+                int k_row = nc * 8 + (lane_id % 8);
+                int k_col = dc * 16 + ((lane_id / 8) % 2) * 8;
+                const void *addr_k = &smem_K_cur[bk::swizzle_idx<HEAD_DIM>(k_row, k_col)];
 
                 uint32_t K_rmem0, K_rmem1;
-                K_rmem0 = *reinterpret_cast<const uint32_t*>(
-                    &smem_K_cur[bk::swizzle_idx<HEAD_DIM>(kv_idx, d_base)]);
-                K_rmem1 = *reinterpret_cast<const uint32_t*>(
-                    &smem_K_cur[bk::swizzle_idx<HEAD_DIM>(kv_idx, d_base + 8)]);
+                bk::ldmatrix_x2(K_rmem0, K_rmem1, addr_k);
 
                 bk::mma_m16n8k16_bf16(
                     S_rmem[nc][0], S_rmem[nc][1],
