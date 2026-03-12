@@ -278,19 +278,23 @@ flash_attn_v2_kernel(
         // D.3: Apply scale and causal mask
         // ============================================================
         // Scale already applied to Q registers (Phase B)
-        #pragma unroll
-        for (int nc = 0; nc < S_N_CHUNKS; nc++) {
-            int col0 = kv_start + nc * 8 + (lane_id % 4) * 2;
-            int col1 = col0 + 1;
+        // Skip mask entirely for KV blocks fully before Q rows and in-bounds
+        if ((causal && kv_start + BLOCK_KV > q_start) ||
+            kv_start + BLOCK_KV > seq_len) {
+            #pragma unroll
+            for (int nc = 0; nc < S_N_CHUNKS; nc++) {
+                int col0 = kv_start + nc * 8 + (lane_id % 4) * 2;
+                int col1 = col0 + 1;
 
-            if (causal) {
-                if (col0 > global_row0) S_rmem[nc][0] = -FLT_MAX;
-                if (col1 > global_row0) S_rmem[nc][1] = -FLT_MAX;
-                if (col0 > global_row1) S_rmem[nc][2] = -FLT_MAX;
-                if (col1 > global_row1) S_rmem[nc][3] = -FLT_MAX;
+                if (causal) {
+                    if (col0 > global_row0) S_rmem[nc][0] = -FLT_MAX;
+                    if (col1 > global_row0) S_rmem[nc][1] = -FLT_MAX;
+                    if (col0 > global_row1) S_rmem[nc][2] = -FLT_MAX;
+                    if (col1 > global_row1) S_rmem[nc][3] = -FLT_MAX;
+                }
+                if (col0 >= seq_len) { S_rmem[nc][0] = -FLT_MAX; S_rmem[nc][2] = -FLT_MAX; }
+                if (col1 >= seq_len) { S_rmem[nc][1] = -FLT_MAX; S_rmem[nc][3] = -FLT_MAX; }
             }
-            if (col0 >= seq_len) { S_rmem[nc][0] = -FLT_MAX; S_rmem[nc][2] = -FLT_MAX; }
-            if (col1 >= seq_len) { S_rmem[nc][1] = -FLT_MAX; S_rmem[nc][3] = -FLT_MAX; }
         }
 
         // ============================================================
