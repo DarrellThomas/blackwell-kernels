@@ -52,7 +52,7 @@ __device__ __forceinline__ uint32_t pack_bf16x2(float a, float b)
 // ============================================================
 
 template <int HEAD_DIM, int BLOCK_KV>
-__global__ void __launch_bounds__(V2_THREADS)
+__global__ void __launch_bounds__(V2_THREADS, 3)
 flash_attn_v2_kernel(
     const __nv_bfloat16 *__restrict__ Q,   // [B*H, N, D]
     const __nv_bfloat16 *__restrict__ K,   // [B*H, N, D]
@@ -133,8 +133,21 @@ flash_attn_v2_kernel(
                             Q_rmem[dc][2], Q_rmem[dc][3], addr);
         }
     }
+    // Pre-scale Q by attention scale factor — eliminates per-block scale multiply
+    {
+        __nv_bfloat162 scale_vec = __float2bfloat162_rn(scale);
+        #pragma unroll
+        for (int dc = 0; dc < D_CHUNKS; dc++) {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                __nv_bfloat162 q_val = *reinterpret_cast<__nv_bfloat162*>(&Q_rmem[dc][i]);
+                q_val = __hmul2(q_val, scale_vec);
+                Q_rmem[dc][i] = *reinterpret_cast<uint32_t*>(&q_val);
+            }
+        }
+    }
     __syncthreads();
-    // Q now in registers. K0+K1 space is free for KV double-buffering.
+    // Q now in registers (pre-scaled). K0+K1 space is free for KV double-buffering.
 
     // ================================================================
     // Phase C: Initialize O accumulators and softmax state
@@ -240,14 +253,15 @@ flash_attn_v2_kernel(
         for (int dc = 0; dc < D_CHUNKS; dc++) {
             #pragma unroll
             for (int nc = 0; nc < S_N_CHUNKS; nc++) {
-                int kv_idx = nc * 8 + lane_id / 4;
-                int d_base = dc * 16 + (lane_id % 4) * 2;
+                // ldmatrix_x2: warp-cooperative load of B fragment for Q*K^T
+                // Threads 0-7→matrix0 (cols 0-7), 8-15→matrix1 (cols 8-15),
+                // 16-23/24-31 mirror 0-7/8-15.
+                int k_row = nc * 8 + (lane_id % 8);
+                int k_col = dc * 16 + ((lane_id / 8) % 2) * 8;
+                const void *addr_k = &smem_K_cur[bk::swizzle_idx<HEAD_DIM>(k_row, k_col)];
 
                 uint32_t K_rmem0, K_rmem1;
-                K_rmem0 = *reinterpret_cast<const uint32_t*>(
-                    &smem_K_cur[bk::swizzle_idx<HEAD_DIM>(kv_idx, d_base)]);
-                K_rmem1 = *reinterpret_cast<const uint32_t*>(
-                    &smem_K_cur[bk::swizzle_idx<HEAD_DIM>(kv_idx, d_base + 8)]);
+                bk::ldmatrix_x2(K_rmem0, K_rmem1, addr_k);
 
                 bk::mma_m16n8k16_bf16(
                     S_rmem[nc][0], S_rmem[nc][1],
@@ -263,13 +277,9 @@ flash_attn_v2_kernel(
         // ============================================================
         // D.3: Apply scale and causal mask
         // ============================================================
+        // Scale already applied to Q registers (Phase B)
         #pragma unroll
         for (int nc = 0; nc < S_N_CHUNKS; nc++) {
-            S_rmem[nc][0] *= scale;
-            S_rmem[nc][1] *= scale;
-            S_rmem[nc][2] *= scale;
-            S_rmem[nc][3] *= scale;
-
             int col0 = kv_start + nc * 8 + (lane_id % 4) * 2;
             int col1 = col0 + 1;
 
@@ -395,19 +405,18 @@ flash_attn_v2_kernel(
         O_rmem[nc][2] *= inv_sum[1]; O_rmem[nc][3] *= inv_sum[1];
     }
 
-    // Store O: thread owns (row0, col0/1) and (row1, col0/1) per n-chunk
+    // Store O: pack adjacent bf16 pairs into uint32 for coalesced 4-byte stores
     #pragma unroll
     for (int nc = 0; nc < O_N_CHUNKS; nc++) {
         int col0 = nc * 8 + (lane_id % 4) * 2;
-        int col1 = col0 + 1;
 
         if (global_row0 < seq_len) {
-            O_bh[global_row0 * HEAD_DIM + col0] = __float2bfloat16(O_rmem[nc][0]);
-            O_bh[global_row0 * HEAD_DIM + col1] = __float2bfloat16(O_rmem[nc][1]);
+            *reinterpret_cast<uint32_t*>(&O_bh[global_row0 * HEAD_DIM + col0]) =
+                pack_bf16x2(O_rmem[nc][0], O_rmem[nc][1]);
         }
         if (global_row1 < seq_len) {
-            O_bh[global_row1 * HEAD_DIM + col0] = __float2bfloat16(O_rmem[nc][2]);
-            O_bh[global_row1 * HEAD_DIM + col1] = __float2bfloat16(O_rmem[nc][3]);
+            *reinterpret_cast<uint32_t*>(&O_bh[global_row1 * HEAD_DIM + col0]) =
+                pack_bf16x2(O_rmem[nc][2], O_rmem[nc][3]);
         }
     }
 
@@ -461,10 +470,11 @@ void flash_attn_v2_fwd(
             Q, K, V, O, L, seq_len, scale, causal);
     };
 
-    // D=128 uses BLOCK_KV=32 to reduce shared memory and double occupancy
+    // BLOCK_KV=64 gives best MMA:overhead ratio for D=32/64 (32KB smem, 4 blocks/SM)
+    // D=128 uses BLOCK_KV=32 to keep smem at 16KB for higher occupancy
     switch (head_dim) {
         case 32:  launch(flash_attn_v2_kernel<32, 64>,  compute_smem(32, 64));  break;
-        case 64:  launch(flash_attn_v2_kernel<64, 32>,  compute_smem(64, 32));  break;
+        case 64:  launch(flash_attn_v2_kernel<64, 64>,  compute_smem(64, 64));  break;
         case 128: launch(flash_attn_v2_kernel<128, 32>, compute_smem(128, 32)); break;
         default: break;
     }
