@@ -90,7 +90,7 @@ Steps:
 5. Create log dir: `mkdir -p logs/<kernel>`
 6. Run baseline: `./eval.sh --kernel <kernel> > eval.log 2>&1`
 7. Record baseline in `results/<kernel>.tsv`.
-8. Confirm setup with user, then begin the optimization loop per `program.md`.
+8. Confirm setup with user, then begin the optimization loop per the kernel's program file (`program_gemm.md` for gemm, `program_attention.md` for attention).
 
 ### Scenario B: Resume on Same Branch
 **Conditions:** Currently on an `autokernel/*` branch AND `results/<kernel>.tsv` exists with data.
@@ -101,7 +101,7 @@ Steps:
 3. Check for uncommitted changes.
 4. Run a fresh eval: `./eval.sh --kernel <kernel> > eval.log 2>&1`
 5. Report: "Resuming from iteration N. Last kept: X us / Y.Yx. Bottleneck: Z."
-6. Continue the optimization loop per `program.md`.
+6. Continue the optimization loop per the kernel's program file (`program_gemm.md` for gemm, `program_attention.md` for attention).
 
 ### Scenario C: Resume on Wrong Branch
 **Conditions:** NOT on an `autokernel/*` branch, but autokernel branches exist.
@@ -137,10 +137,12 @@ grep -E "^(build|test|bench|profile|primary_|tsv_|top_)" eval.log
 
 ## Core References
 
-All detailed loop instructions are in `program.md`. Read it fully before beginning.
+**Each kernel has its own program file.** Read the correct one fully before beginning:
 
-Key files to read on startup:
-- `program.md` — loop instructions, metrics, exit criteria
+- **gemm**: `program_gemm.md` — GEMM-specific loop, metrics (`vs_ref`), architecture summary
+- **attention**: `program_attention.md` — attention-specific loop, metrics (`vs_sdpa`), exit criteria
+
+Additional files to read on startup:
 - `.claude/04_HARD_WON_LESSONS.md` — invariants and guardrails
 - `docs/nvidia_blackwell_tuning_guide_sm120.md` — sm_120 hardware limits
 - The kernel source file for the target kernel (see Per-Kernel Configuration)

@@ -146,8 +146,7 @@ docs/                         ← curated CUDA reference docs
 .claude/
   04_HARD_WON_LESSONS.md      ← empirical knowledge (the good stuff)
   CLAUDE.md                   ← agent context (MMA register layout, build commands)
-program.md                    ← autonomous loop instructions
-dashboard.py                  ← live optimization dashboard
+program_gemm.md               ← GEMM optimization loop instructions
 eval.sh                       ← build → test → bench → profile pipeline
 ```
 

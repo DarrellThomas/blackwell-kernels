@@ -60,7 +60,7 @@ Open **http://localhost:8420** in a browser. Leave it open — it auto-refreshes
 In a Claude Code session in the `blackwell-kernels` directory:
 
 ```
-Follow the instructions in program.md to start an autokernel run.
+Use `/autokernel <kernel> <tag>` to start a run (reads program_attention.md or program_gemm.md).
 ```
 
 The agent will:
@@ -130,7 +130,7 @@ You can also interrupt it manually anytime (Ctrl+C the Claude session). All prog
 
 | File | Purpose | Modified by agent? |
 |------|---------|-------------------|
-| `program.md` | Agent instructions (the "skill") | No |
+| `program_attention.md` / `program_gemm.md` | Per-kernel loop instructions | No |
 | `eval.sh` | Build → test → bench → profile pipeline | No |
 | `dashboard.py` | Live web dashboard | No |
 | `results.tsv` | Experiment log | Yes (append only) |
