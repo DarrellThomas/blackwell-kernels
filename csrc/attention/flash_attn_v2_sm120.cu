@@ -35,7 +35,6 @@
 // ============================================================
 
 constexpr int V2_BLOCK_Q = 64;
-constexpr int V2_BLOCK_KV = 64;
 constexpr int V2_NUM_WARPS = 4;
 constexpr int V2_WARP_SIZE = 32;
 constexpr int V2_THREADS = V2_NUM_WARPS * V2_WARP_SIZE;  // 128
@@ -46,7 +45,7 @@ constexpr int V2_WARP_Q = V2_BLOCK_Q / V2_NUM_WARPS;     // 16
 // v2 kernel
 // ============================================================
 
-template <int HEAD_DIM>
+template <int HEAD_DIM, int BLOCK_KV>
 __global__ void __launch_bounds__(V2_THREADS)
 flash_attn_v2_kernel(
     const __nv_bfloat16 *__restrict__ Q,   // [B*H, N, D]
@@ -75,9 +74,9 @@ flash_attn_v2_kernel(
     // ---- Shared memory layout (double-buffered K/V, XOR swizzled) ----
     // No padding — swizzle_idx handles bank conflict avoidance.
     constexpr int Q_SMEM_ELEMS = V2_BLOCK_Q * HEAD_DIM;
-    constexpr int KV_SMEM_ELEMS = V2_BLOCK_KV * HEAD_DIM;
+    constexpr int KV_SMEM_ELEMS = BLOCK_KV * HEAD_DIM;
     // P reuses Q region. QP must hold whichever is larger (P > Q for D=32).
-    constexpr int P_SMEM_ELEMS = V2_BLOCK_Q * V2_BLOCK_KV;
+    constexpr int P_SMEM_ELEMS = V2_BLOCK_Q * BLOCK_KV;
     constexpr int QP_SMEM_ELEMS = (Q_SMEM_ELEMS > P_SMEM_ELEMS) ? Q_SMEM_ELEMS : P_SMEM_ELEMS;
 
     // Layout: [Q/P: QP_SMEM_ELEMS] [K0: KV] [K1: KV] [V0: KV] [V1: KV]
@@ -161,10 +160,10 @@ flash_attn_v2_kernel(
     // Phase D: KV loop
     // ================================================================
     int kv_end = causal ? min(seq_len, q_start + V2_BLOCK_Q) : seq_len;
-    int num_kv_blocks = (kv_end + V2_BLOCK_KV - 1) / V2_BLOCK_KV;
+    int num_kv_blocks = (kv_end + BLOCK_KV - 1) / BLOCK_KV;
 
-    constexpr int S_N_CHUNKS = V2_BLOCK_KV / 8;   // 8
-    constexpr int P_K_CHUNKS = V2_BLOCK_KV / 16;   // 4
+    constexpr int S_N_CHUNKS = BLOCK_KV / 8;   // 8
+    constexpr int P_K_CHUNKS = BLOCK_KV / 16;   // 4
 
     // ================================================================
     // Prologue: Load first K/V tile into double-buffer slot 0
@@ -173,7 +172,7 @@ flash_attn_v2_kernel(
         __nv_bfloat16 *smem_K0 = smem_K_base;
         __nv_bfloat16 *smem_V0 = smem_V_base;
         constexpr int CHUNKS_PER_ROW = HEAD_DIM / 8;
-        constexpr int TOTAL_CHUNKS = V2_BLOCK_KV * CHUNKS_PER_ROW;
+        constexpr int TOTAL_CHUNKS = BLOCK_KV * CHUNKS_PER_ROW;
         for (int i = tid; i < TOTAL_CHUNKS; i += V2_THREADS) {
             int row = i / CHUNKS_PER_ROW;
             int col = (i % CHUNKS_PER_ROW) * 8;
@@ -193,7 +192,7 @@ flash_attn_v2_kernel(
     __syncthreads();
 
     for (int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
-        int kv_start = kv_block * V2_BLOCK_KV;
+        int kv_start = kv_block * BLOCK_KV;
         int cur = kv_block & 1;
         __nv_bfloat16 *smem_K_cur = smem_K_base + cur * KV_SMEM_ELEMS;
         __nv_bfloat16 *smem_V_cur = smem_V_base + cur * KV_SMEM_ELEMS;
@@ -203,11 +202,11 @@ flash_attn_v2_kernel(
         // ============================================================
         if (kv_block + 1 < num_kv_blocks) {
             int nxt = 1 - cur;
-            int kv_start_nxt = (kv_block + 1) * V2_BLOCK_KV;
+            int kv_start_nxt = (kv_block + 1) * BLOCK_KV;
             __nv_bfloat16 *smem_K_nxt = smem_K_base + nxt * KV_SMEM_ELEMS;
             __nv_bfloat16 *smem_V_nxt = smem_V_base + nxt * KV_SMEM_ELEMS;
             constexpr int CHUNKS_PER_ROW = HEAD_DIM / 8;
-            constexpr int TOTAL_CHUNKS = V2_BLOCK_KV * CHUNKS_PER_ROW;
+            constexpr int TOTAL_CHUNKS = BLOCK_KV * CHUNKS_PER_ROW;
             for (int i = tid; i < TOTAL_CHUNKS; i += V2_THREADS) {
                 int row = i / CHUNKS_PER_ROW;
                 int col = (i % CHUNKS_PER_ROW) * 8;
@@ -350,10 +349,10 @@ flash_attn_v2_kernel(
                 int col0 = nc * 8 + (lane_id % 4) * 2;
                 int col1 = col0 + 1;
 
-                smem_P[bk::swizzle_idx<V2_BLOCK_KV>(local_row0, col0)] = __float2bfloat16(S_rmem[nc][0]);
-                smem_P[bk::swizzle_idx<V2_BLOCK_KV>(local_row0, col1)] = __float2bfloat16(S_rmem[nc][1]);
-                smem_P[bk::swizzle_idx<V2_BLOCK_KV>(local_row1, col0)] = __float2bfloat16(S_rmem[nc][2]);
-                smem_P[bk::swizzle_idx<V2_BLOCK_KV>(local_row1, col1)] = __float2bfloat16(S_rmem[nc][3]);
+                smem_P[bk::swizzle_idx<BLOCK_KV>(local_row0, col0)] = __float2bfloat16(S_rmem[nc][0]);
+                smem_P[bk::swizzle_idx<BLOCK_KV>(local_row0, col1)] = __float2bfloat16(S_rmem[nc][1]);
+                smem_P[bk::swizzle_idx<BLOCK_KV>(local_row1, col0)] = __float2bfloat16(S_rmem[nc][2]);
+                smem_P[bk::swizzle_idx<BLOCK_KV>(local_row1, col1)] = __float2bfloat16(S_rmem[nc][3]);
             }
         }
 
@@ -369,7 +368,7 @@ flash_attn_v2_kernel(
             for (int kc = 0; kc < P_K_CHUNKS; kc++) {
                 int p_row = warp_p_off + (p_sub / 2) * 8 + p_t_in_sub;
                 int p_col = kc * 16 + (p_sub % 2) * 8;
-                const void *addr_p = &smem_P[bk::swizzle_idx<V2_BLOCK_KV>(p_row, p_col)];
+                const void *addr_p = &smem_P[bk::swizzle_idx<BLOCK_KV>(p_row, p_col)];
                 bk::ldmatrix_x4(P_rmem[kc][0], P_rmem[kc][1],
                                 P_rmem[kc][2], P_rmem[kc][3], addr_p);
             }
@@ -468,16 +467,15 @@ void flash_attn_v2_fwd(
     dim3 block(V2_THREADS);
 
     // Shared memory: [Q/P] [K0] [K1] [V0] [V1] — double-buffered K/V
-    auto compute_smem = [](int hd) {
+    auto compute_smem = [](int hd, int bkv) {
         int q_elems = V2_BLOCK_Q * hd;
-        int p_elems = V2_BLOCK_Q * V2_BLOCK_KV;
+        int p_elems = V2_BLOCK_Q * bkv;
         int qp_elems = (q_elems > p_elems) ? q_elems : p_elems;
-        int kv_elems = V2_BLOCK_KV * hd;
+        int kv_elems = bkv * hd;
         return (qp_elems + 4 * kv_elems) * (int)sizeof(__nv_bfloat16);
     };
-    int smem_bytes = compute_smem(head_dim);
 
-    auto launch = [&](auto kernel_fn) {
+    auto launch = [&](auto kernel_fn, int smem_bytes) {
         if (smem_bytes > 48 * 1024) {
             cudaFuncSetAttribute(kernel_fn,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
@@ -486,10 +484,11 @@ void flash_attn_v2_fwd(
             Q, K, V, O, L, seq_len, scale, causal);
     };
 
+    // D=128 uses BLOCK_KV=32 to reduce shared memory and double occupancy
     switch (head_dim) {
-        case 32:  launch(flash_attn_v2_kernel<32>);  break;
-        case 64:  launch(flash_attn_v2_kernel<64>);  break;
-        case 128: launch(flash_attn_v2_kernel<128>); break;
+        case 32:  launch(flash_attn_v2_kernel<32, 64>,  compute_smem(32, 64));  break;
+        case 64:  launch(flash_attn_v2_kernel<64, 32>,  compute_smem(64, 32));  break;
+        case 128: launch(flash_attn_v2_kernel<128, 32>, compute_smem(128, 32)); break;
         default: break;
     }
 }
