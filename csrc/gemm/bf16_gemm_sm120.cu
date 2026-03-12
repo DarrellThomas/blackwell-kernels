@@ -53,7 +53,7 @@ constexpr int GEMM_MMA_K_TILES = GEMM_BLOCK_K / 16;            // 2
 // GEMM kernel
 // ============================================================
 
-__global__ void __launch_bounds__(GEMM_THREADS, 2)
+__global__ void __launch_bounds__(GEMM_THREADS, 1)
 bf16_gemm_kernel(
     const __nv_bfloat16 *__restrict__ A,   // [M, K] row-major
     const __nv_bfloat16 *__restrict__ B,   // [K, N] row-major
