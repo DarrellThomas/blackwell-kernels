@@ -226,25 +226,35 @@ flash_attn_v2_kernel(
         #pragma unroll
         for (int dc = 0; dc < D_CHUNKS; dc++) {
             #pragma unroll
-            for (int nc = 0; nc < S_N_CHUNKS; nc++) {
-                // ldmatrix_x2: warp-cooperative load of B fragment for Q*K^T
-                // Threads 0-7→matrix0 (cols 0-7), 8-15→matrix1 (cols 8-15),
-                // 16-23/24-31 mirror 0-7/8-15.
-                int k_row = nc * 8 + (lane_id % 8);
-                int k_col = dc * 16 + ((lane_id / 8) % 2) * 8;
+            for (int nc = 0; nc < S_N_CHUNKS; nc += 2) {
+                // ldmatrix.x4: load 2 consecutive K B-fragments at once
+                // Sub 0,1 → nc tile; Sub 2,3 → nc+1 tile
+                int sub = lane_id / 8;
+                int t_in_sub = lane_id % 8;
+                int k_row = (nc + sub / 2) * 8 + t_in_sub;
+                int k_col = dc * 16 + (sub % 2) * 8;
                 const void *addr_k = &smem_K_cur[bk::swizzle_idx<HEAD_DIM>(k_row, k_col)];
 
-                uint32_t K_rmem0, K_rmem1;
-                bk::ldmatrix_x2(K_rmem0, K_rmem1, addr_k);
+                uint32_t K_r0, K_r1, K_r2, K_r3;
+                bk::ldmatrix_x4(K_r0, K_r1, K_r2, K_r3, addr_k);
 
                 bk::mma_m16n8k16_bf16(
                     S_rmem[nc][0], S_rmem[nc][1],
                     S_rmem[nc][2], S_rmem[nc][3],
                     Q_rmem[dc][0], Q_rmem[dc][2],
                     Q_rmem[dc][1], Q_rmem[dc][3],
-                    K_rmem0, K_rmem1,
+                    K_r0, K_r1,
                     S_rmem[nc][0], S_rmem[nc][1],
                     S_rmem[nc][2], S_rmem[nc][3]);
+
+                bk::mma_m16n8k16_bf16(
+                    S_rmem[nc+1][0], S_rmem[nc+1][1],
+                    S_rmem[nc+1][2], S_rmem[nc+1][3],
+                    Q_rmem[dc][0], Q_rmem[dc][2],
+                    Q_rmem[dc][1], Q_rmem[dc][3],
+                    K_r2, K_r3,
+                    S_rmem[nc+1][0], S_rmem[nc+1][1],
+                    S_rmem[nc+1][2], S_rmem[nc+1][3]);
             }
         }
 
@@ -372,21 +382,33 @@ flash_attn_v2_kernel(
                 uint32_t P_a3 = pack_bf16x2(S_rmem[nc1][2], S_rmem[nc1][3]);
 
                 #pragma unroll
-                for (int nc = 0; nc < O_N_CHUNKS; nc++) {
-                    int v_row = kc * 16 + (lane_id % 8) + ((lane_id / 8) % 2) * 8;
-                    int v_col = nc * 8;
+                for (int nc = 0; nc < O_N_CHUNKS; nc += 2) {
+                    // ldmatrix.x4.trans: load 2 consecutive V B-fragments
+                    // Sub 0,1 → nc tile; Sub 2,3 → nc+1 tile
+                    int sub = lane_id / 8;
+                    int t_in_sub = lane_id % 8;
+                    int v_row = kc * 16 + (sub % 2) * 8 + t_in_sub;
+                    int v_col = (nc + sub / 2) * 8;
                     const void *addr_v = &smem_V_cur[bk::swizzle_idx<HEAD_DIM>(v_row, v_col)];
 
-                    uint32_t V_rmem0, V_rmem1;
-                    bk::ldmatrix_x2_trans(V_rmem0, V_rmem1, addr_v);
+                    uint32_t V_r0, V_r1, V_r2, V_r3;
+                    bk::ldmatrix_x4_trans(V_r0, V_r1, V_r2, V_r3, addr_v);
 
                     bk::mma_m16n8k16_bf16(
                         O_rmem[nc][0], O_rmem[nc][1],
                         O_rmem[nc][2], O_rmem[nc][3],
                         P_a0, P_a1, P_a2, P_a3,
-                        V_rmem0, V_rmem1,
+                        V_r0, V_r1,
                         O_rmem[nc][0], O_rmem[nc][1],
                         O_rmem[nc][2], O_rmem[nc][3]);
+
+                    bk::mma_m16n8k16_bf16(
+                        O_rmem[nc+1][0], O_rmem[nc+1][1],
+                        O_rmem[nc+1][2], O_rmem[nc+1][3],
+                        P_a0, P_a1, P_a2, P_a3,
+                        V_r2, V_r3,
+                        O_rmem[nc+1][0], O_rmem[nc+1][1],
+                        O_rmem[nc+1][2], O_rmem[nc+1][3]);
                 }
             }
         }
