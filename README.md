@@ -1,6 +1,6 @@
 # blackwell-kernels
 
-Custom CUDA kernels for the RTX 5090 (sm_120) — hand-optimized for a GPU that deserves better software.
+Custom CUDA kernels for the RTX 5090 (sm_120) — unlocking the full potential of consumer Blackwell.
 
 ## Why This Exists
 
