@@ -12,11 +12,11 @@
 //                                                               |
 //                                                         --[store]--> Global Memory
 //
-// Tile config: BLOCK_Q=64, BLOCK_KV=64, 4 warps (128 threads)
+// Tile config: BLOCK_Q=64, BLOCK_KV=32/64, 4 warps (128 threads)
 // Each warp handles 16 Q rows (one m16 MMA tile).
 // Q loaded once to registers, reused across all KV blocks.
-// S→P conversion via shared memory round-trip (accumulator and A-fragment
-// have different thread-to-element mappings).
+// S→P conversion via warp shuffles (register-only, no shared memory).
+// Q overlaps KV buffer space during init (freed before KV loop).
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -39,7 +39,13 @@ constexpr int V2_NUM_WARPS = 4;
 constexpr int V2_WARP_SIZE = 32;
 constexpr int V2_THREADS = V2_NUM_WARPS * V2_WARP_SIZE;  // 128
 constexpr int V2_WARP_Q = V2_BLOCK_Q / V2_NUM_WARPS;     // 16
-// Padding removed — XOR swizzle handles bank conflict avoidance
+
+// Pack two float values into a uint32_t as bf16x2 (for MMA A-fragment)
+__device__ __forceinline__ uint32_t pack_bf16x2(float a, float b)
+{
+    __nv_bfloat162 packed = __floats2bfloat162_rn(a, b);
+    return *reinterpret_cast<uint32_t*>(&packed);
+}
 
 // ============================================================
 // v2 kernel
@@ -72,19 +78,16 @@ flash_attn_v2_kernel(
     float *L_bh = L + bh_idx * seq_len;
 
     // ---- Shared memory layout (double-buffered K/V, XOR swizzled) ----
-    // No padding — swizzle_idx handles bank conflict avoidance.
-    constexpr int Q_SMEM_ELEMS = V2_BLOCK_Q * HEAD_DIM;
+    // P conversion is register-only (shuffles), no shared memory needed.
+    // Q overlaps K0+K1 during Phase A/B, then freed for KV use.
+    // Layout: [K0: KV] [K1: KV] [V0: KV] [V1: KV]
     constexpr int KV_SMEM_ELEMS = BLOCK_KV * HEAD_DIM;
-    // P reuses Q region. QP must hold whichever is larger (P > Q for D=32).
-    constexpr int P_SMEM_ELEMS = V2_BLOCK_Q * BLOCK_KV;
-    constexpr int QP_SMEM_ELEMS = (Q_SMEM_ELEMS > P_SMEM_ELEMS) ? Q_SMEM_ELEMS : P_SMEM_ELEMS;
 
-    // Layout: [Q/P: QP_SMEM_ELEMS] [K0: KV] [K1: KV] [V0: KV] [V1: KV]
     extern __shared__ char smem_raw[];
-    __nv_bfloat16 *smem_QP = reinterpret_cast<__nv_bfloat16 *>(smem_raw);
-    __nv_bfloat16 *smem_K_base = smem_QP + QP_SMEM_ELEMS;
-    __nv_bfloat16 *smem_V_base = smem_K_base + 2 * KV_SMEM_ELEMS;
-    __nv_bfloat16 *smem_P = smem_QP;  // P reuses Q/P region
+    __nv_bfloat16 *smem_base = reinterpret_cast<__nv_bfloat16 *>(smem_raw);
+    __nv_bfloat16 *smem_Q = smem_base;  // Q overlaps K0+(K1) during init
+    __nv_bfloat16 *smem_K_base = smem_base;
+    __nv_bfloat16 *smem_V_base = smem_base + 2 * KV_SMEM_ELEMS;
 
     // ================================================================
     // Phase A: Load Q tile global → shared memory via cp.async
@@ -97,7 +100,7 @@ flash_attn_v2_kernel(
             int col = (i % CHUNKS_PER_ROW) * 8;
             int global_row = q_start + row;
             bk::cp_async_128_zfill(
-                &smem_QP[bk::swizzle_idx<HEAD_DIM>(row, col)],
+                &smem_Q[bk::swizzle_idx<HEAD_DIM>(row, col)],
                 &Q_bh[global_row * HEAD_DIM + col],
                 global_row < seq_len);
         }
@@ -125,13 +128,13 @@ flash_attn_v2_kernel(
         for (int dc = 0; dc < D_CHUNKS; dc++) {
             int smem_row = warp_q_off + (sub / 2) * 8 + t_in_sub;
             int smem_col = dc * 16 + (sub % 2) * 8;
-            const void *addr = &smem_QP[bk::swizzle_idx<HEAD_DIM>(smem_row, smem_col)];
+            const void *addr = &smem_Q[bk::swizzle_idx<HEAD_DIM>(smem_row, smem_col)];
             bk::ldmatrix_x4(Q_rmem[dc][0], Q_rmem[dc][1],
                             Q_rmem[dc][2], Q_rmem[dc][3], addr);
         }
     }
     __syncthreads();
-    // Q now in registers. smem_Q is free for P reuse.
+    // Q now in registers. K0+K1 space is free for KV double-buffering.
 
     // ================================================================
     // Phase C: Initialize O accumulators and softmax state
@@ -335,69 +338,46 @@ flash_attn_v2_kernel(
         row_max[1] = new_max[1];
 
         // ============================================================
-        // D.5: Write P to shared memory
+        // D.5-6: Register-only P→A conversion + P*V MMA
         // ============================================================
-        // V already in smem_V_cur from prologue/prefetch.
-        // P writes to smem_P (= smem_QP), separate from K/V buffers.
-        // Each warp writes only its own 16 rows — no cross-warp conflict.
+        // D-fragment: d0=P[T/4,(T%4)*2], d1=P[T/4,(T%4)*2+1],
+        //             d2=P[T/4+8,(T%4)*2], d3=P[T/4+8,(T%4)*2+1]
+        // A-fragment: a0={A[T/4,(T%4)*2..+1]}, a1={A[T/4+8,(T%4)*2..+1]},
+        //             a2={A[T/4,(T%4)*2+8..+9]}, a3={A[T/4+8,(T%4)*2+8..+9]}
+        // Same thread-to-element mapping! Just pack float pairs → bf16x2.
+        // Each k-chunk (16 cols) spans 2 n-chunks (8 cols each).
         {
-            int local_row0 = warp_id * V2_WARP_Q + (lane_id / 4);
-            int local_row1 = local_row0 + 8;
-
-            #pragma unroll
-            for (int nc = 0; nc < S_N_CHUNKS; nc++) {
-                int col0 = nc * 8 + (lane_id % 4) * 2;
-                int col1 = col0 + 1;
-
-                smem_P[bk::swizzle_idx<BLOCK_KV>(local_row0, col0)] = __float2bfloat16(S_rmem[nc][0]);
-                smem_P[bk::swizzle_idx<BLOCK_KV>(local_row0, col1)] = __float2bfloat16(S_rmem[nc][1]);
-                smem_P[bk::swizzle_idx<BLOCK_KV>(local_row1, col0)] = __float2bfloat16(S_rmem[nc][2]);
-                smem_P[bk::swizzle_idx<BLOCK_KV>(local_row1, col1)] = __float2bfloat16(S_rmem[nc][3]);
-            }
-        }
-
-        // ============================================================
-        // D.6: Load P via ldmatrix_x4, compute O += P * V via MMA
-        // ============================================================
-        uint32_t P_rmem[P_K_CHUNKS][4];
-        {
-            int warp_p_off = warp_id * V2_WARP_Q;
-            int p_sub = lane_id / 8;
-            int p_t_in_sub = lane_id % 8;
             #pragma unroll
             for (int kc = 0; kc < P_K_CHUNKS; kc++) {
-                int p_row = warp_p_off + (p_sub / 2) * 8 + p_t_in_sub;
-                int p_col = kc * 16 + (p_sub % 2) * 8;
-                const void *addr_p = &smem_P[bk::swizzle_idx<BLOCK_KV>(p_row, p_col)];
-                bk::ldmatrix_x4(P_rmem[kc][0], P_rmem[kc][1],
-                                P_rmem[kc][2], P_rmem[kc][3], addr_p);
+                int nc0 = 2 * kc;
+                int nc1 = 2 * kc + 1;
+
+                uint32_t P_a0 = pack_bf16x2(S_rmem[nc0][0], S_rmem[nc0][1]);
+                uint32_t P_a1 = pack_bf16x2(S_rmem[nc0][2], S_rmem[nc0][3]);
+                uint32_t P_a2 = pack_bf16x2(S_rmem[nc1][0], S_rmem[nc1][1]);
+                uint32_t P_a3 = pack_bf16x2(S_rmem[nc1][2], S_rmem[nc1][3]);
+
+                #pragma unroll
+                for (int nc = 0; nc < O_N_CHUNKS; nc++) {
+                    int v_row = kc * 16 + (lane_id % 8) + ((lane_id / 8) % 2) * 8;
+                    int v_col = nc * 8;
+                    const void *addr_v = &smem_V_cur[bk::swizzle_idx<HEAD_DIM>(v_row, v_col)];
+
+                    uint32_t V_rmem0, V_rmem1;
+                    bk::ldmatrix_x2_trans(V_rmem0, V_rmem1, addr_v);
+
+                    bk::mma_m16n8k16_bf16(
+                        O_rmem[nc][0], O_rmem[nc][1],
+                        O_rmem[nc][2], O_rmem[nc][3],
+                        P_a0, P_a1, P_a2, P_a3,
+                        V_rmem0, V_rmem1,
+                        O_rmem[nc][0], O_rmem[nc][1],
+                        O_rmem[nc][2], O_rmem[nc][3]);
+                }
             }
         }
 
-        #pragma unroll
-        for (int nc = 0; nc < O_N_CHUNKS; nc++) {
-            #pragma unroll
-            for (int kc = 0; kc < P_K_CHUNKS; kc++) {
-                int v_row = kc * 16 + (lane_id % 8) + ((lane_id / 8) % 2) * 8;
-                int v_col = nc * 8;
-                const void *addr_v = &smem_V_cur[bk::swizzle_idx<HEAD_DIM>(v_row, v_col)];
-
-                uint32_t V_rmem0, V_rmem1;
-                bk::ldmatrix_x2_trans(V_rmem0, V_rmem1, addr_v);
-
-                bk::mma_m16n8k16_bf16(
-                    O_rmem[nc][0], O_rmem[nc][1],
-                    O_rmem[nc][2], O_rmem[nc][3],
-                    P_rmem[kc][0], P_rmem[kc][2],
-                    P_rmem[kc][1], P_rmem[kc][3],
-                    V_rmem0, V_rmem1,
-                    O_rmem[nc][0], O_rmem[nc][1],
-                    O_rmem[nc][2], O_rmem[nc][3]);
-            }
-        }
-
-        // Single sync: ensures D.6 reads complete before next P write,
-        // and prefetch data is visible for next iteration
+        // Sync: prefetch data visible for next iteration
         bk::cp_async_wait<0>();
         __syncthreads();
     } // end KV loop
@@ -466,13 +446,10 @@ void flash_attn_v2_fwd(
     dim3 grid(num_q_blocks, bh);
     dim3 block(V2_THREADS);
 
-    // Shared memory: [Q/P] [K0] [K1] [V0] [V1] — double-buffered K/V
+    // Shared memory: [K0] [K1] [V0] [V1] — Q overlaps K during init
     auto compute_smem = [](int hd, int bkv) {
-        int q_elems = V2_BLOCK_Q * hd;
-        int p_elems = V2_BLOCK_Q * bkv;
-        int qp_elems = (q_elems > p_elems) ? q_elems : p_elems;
         int kv_elems = bkv * hd;
-        return (qp_elems + 4 * kv_elems) * (int)sizeof(__nv_bfloat16);
+        return 4 * kv_elems * (int)sizeof(__nv_bfloat16);
     };
 
     auto launch = [&](auto kernel_fn, int smem_bytes) {
