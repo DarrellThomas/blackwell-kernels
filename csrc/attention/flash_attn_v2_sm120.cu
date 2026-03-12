@@ -395,19 +395,18 @@ flash_attn_v2_kernel(
         O_rmem[nc][2] *= inv_sum[1]; O_rmem[nc][3] *= inv_sum[1];
     }
 
-    // Store O: thread owns (row0, col0/1) and (row1, col0/1) per n-chunk
+    // Store O: pack adjacent bf16 pairs into uint32 for coalesced 4-byte stores
     #pragma unroll
     for (int nc = 0; nc < O_N_CHUNKS; nc++) {
         int col0 = nc * 8 + (lane_id % 4) * 2;
-        int col1 = col0 + 1;
 
         if (global_row0 < seq_len) {
-            O_bh[global_row0 * HEAD_DIM + col0] = __float2bfloat16(O_rmem[nc][0]);
-            O_bh[global_row0 * HEAD_DIM + col1] = __float2bfloat16(O_rmem[nc][1]);
+            *reinterpret_cast<uint32_t*>(&O_bh[global_row0 * HEAD_DIM + col0]) =
+                pack_bf16x2(O_rmem[nc][0], O_rmem[nc][1]);
         }
         if (global_row1 < seq_len) {
-            O_bh[global_row1 * HEAD_DIM + col0] = __float2bfloat16(O_rmem[nc][2]);
-            O_bh[global_row1 * HEAD_DIM + col1] = __float2bfloat16(O_rmem[nc][3]);
+            *reinterpret_cast<uint32_t*>(&O_bh[global_row1 * HEAD_DIM + col0]) =
+                pack_bf16x2(O_rmem[nc][2], O_rmem[nc][3]);
         }
     }
 
