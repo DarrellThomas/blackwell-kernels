@@ -1,0 +1,24 @@
+commit	duration_us	vs_sdpa	sm_pct	stall_math	stall_wait	stall_scoreboard	stall_barrier	top_stall	status	description
+114c55c	98.8	1.61	57.2	41.0	18.0	12.0	6.0	math_throttle	keep	baseline — round 2 (from round 1 final: 1.61x SDPA)
+6a2619b	227.1	0.63	24.1	24.0	17.0	34.0	7.0	long_scoreboard	discard	BLOCK_Q=128 8 warps — register spills killed it
+25c8812	102.9	1.52	53.1	38.0	20.0	15.0	4.0	math_throttle	discard	launch_bounds(128,4) — spill cost > occupancy gain
+n/a	102.1	1.52	54.3	41.0	21.0	12.0	3.0	math_throttle	discard	split K/V prefetch — wait stalls increased, no benefit
+n/a	100.0	1.61	56.3	40.0	18.0	12.0	6.0	math_throttle	discard	V preload in P*V — compiler already optimizes identically, no change
+n/a	118.7	1.27	44.8	34.0	30.0	9.0	1.0	math_throttle	discard	BLOCK_KV=128 launch_bounds(128,2) — occupancy drop 12→8 warps killed latency hiding
+n/a	100.6	1.58	56.3	41.0	15.0	12.0	6.0	math_throttle	discard	split-half softmax — extra scalar overhead cancelled wait reduction
+n/a	105.1	1.51	53.6	36.0	21.0	12.0	6.0	math_throttle	discard	BLOCK_KV=32 launch_bounds(128,4) — doubled iterations hurt more than occupancy gain
+n/a	113.6	1.31	49.1	38.0	22.0	9.0	3.0	math_throttle	discard	Q-in-smem — extra ldmatrix_x4 per kv_block hurt more than register savings helped
+n/a	101.3	1.59	55.2	34.0	24.0	14.0	4.0	math_throttle	discard	nc-outer/dc-inner fused mask+max — math_throttle 41→34% but wait 18→24%, net worse
+0fb7b84	97.8	1.64	58.2	43.0	19.0	11.0	3.0	math_throttle	keep	prefetch after QK^T — barrier 6→3%, SM throughput 56→58%
+n/a	98.2	1.64	58.4	43.0	19.0	11.0	3.0	math_throttle	discard	P*V nc-outer/kc-inner + pre-packed P — compiler unrolls identically, no change
+08488c6	97.1	1.68	58.1	43.0	20.0	12.0	3.0	math_throttle	keep	unconditional exp in softmax — removed 64 compare+select, 2.4% speedup
+303e47e	96.3	1.69	58.0	44.0	20.0	11.0	3.0	math_throttle	keep	exp2f softmax — fold LOG2E into Q scale, save 34 MULs/iter
+5b44875	94.0	1.74	58.7	46.0	18.0	12.0	5.0	math_throttle	keep	skip mask for unmasked KV blocks — 60+ fewer conditionals/iter
+n/a	106.2	1.41	53.4	46.0	20.0	10.0	4.0	math_throttle	discard	BLOCK_KV=96 — bank conflicts doubled (20K), occupancy likely dropped to 2 blocks
+n/a	95.5	1.72	58.2	46.0	18.0	12.0	5.0	math_throttle	discard	skip first-iter rescale — branch overhead outweighs 1-iteration savings
+n/a	94.5	1.73	58.4	46.0	18.0	11.0	5.0	math_throttle	discard	deferred sum reduction after P*V — compiler already reorders, no change
+2cb22e7	93.8	1.76	59.8	48.0	17.0	12.0	5.0	math_throttle	keep	ldmatrix.x4 for K loads + revert asym buffering — fewer instructions per MMA pair
+n/a	93.5	1.70	58.0	49.0	17.0	12.0	5.0	math_throttle	discard	prefetch before QK^T — cp.async/ldmatrix contention during QK^T, 3% bench regression
+n/a	96.7	1.66	55.9	46.0	19.0	12.0	5.0	math_throttle	discard	split prefetch V-before-QKT K-after — extra commit overhead, 3% regression despite 79% fewer bank conflicts
+n/a	150.0	1.01	35.4	53.0	20.0	7.0	2.0	math_throttle	discard	BLOCK_Q=128 only — grid too small for primary config (256 blocks < 340 SMs*2), 35% SM utilization
+n/a	93.5	1.76	59.7	48.0	17.0	12.0	5.0	math_throttle	keep	dynamic BQ dispatch — BQ=128 when grid>=340 blocks, BQ=64 otherwise. N=4096: 2x faster (1.15x SDPA), D=128: 7x faster (1.00x SDPA)
