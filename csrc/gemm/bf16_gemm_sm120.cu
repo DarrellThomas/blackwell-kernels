@@ -14,8 +14,8 @@
 // A is row-major, B is row-major. MMA does A(row) * B(col), so we load B transposed
 // via ldmatrix_x2_trans to get col-major fragments directly.
 //
-// Tile config: BLOCK_M=128, BLOCK_N=128, BLOCK_K=32, 4 warps (128 threads)
-// Each warp computes a 32x128 sub-tile of C (2 m16 tiles in M, all N tiles).
+// Tile config: BLOCK_M=128, BLOCK_N=128, BLOCK_K=32, 8 warps (256 threads)
+// Each warp computes a 16x128 sub-tile of C (1 m16 tile in M, all N tiles).
 // Double-buffered K tiles for pipelining.
 
 #include <torch/extension.h>
@@ -36,16 +36,16 @@
 constexpr int GEMM_BLOCK_M = 128;
 constexpr int GEMM_BLOCK_N = 128;
 constexpr int GEMM_BLOCK_K = 32;
-constexpr int GEMM_NUM_WARPS = 4;
+constexpr int GEMM_NUM_WARPS = 8;
 constexpr int GEMM_WARP_SIZE = 32;
-constexpr int GEMM_THREADS = GEMM_NUM_WARPS * GEMM_WARP_SIZE;  // 128
+constexpr int GEMM_THREADS = GEMM_NUM_WARPS * GEMM_WARP_SIZE;  // 256
 
 // Each warp handles WARP_M rows x full BLOCK_N columns
-constexpr int GEMM_WARP_M = GEMM_BLOCK_M / GEMM_NUM_WARPS;    // 32
+constexpr int GEMM_WARP_M = GEMM_BLOCK_M / GEMM_NUM_WARPS;    // 16
 
 // MMA tile: m16n8k16
-// Per warp: 2 m16 tiles in M dimension, BLOCK_N/8 n8 tiles in N dimension
-constexpr int GEMM_MMA_M_TILES = GEMM_WARP_M / 16;             // 2
+// Per warp: 1 m16 tile in M dimension, BLOCK_N/8 n8 tiles in N dimension
+constexpr int GEMM_MMA_M_TILES = GEMM_WARP_M / 16;             // 1
 constexpr int GEMM_MMA_N_TILES = GEMM_BLOCK_N / 8;             // 16
 constexpr int GEMM_MMA_K_TILES = GEMM_BLOCK_K / 16;            // 2
 
