@@ -3,6 +3,7 @@
 """General-purpose kernel operations for sm_120."""
 
 import torch
+from blackwell_kernels._C import bf16_gemm as _bf16_gemm
 
 
 def bf16_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
@@ -13,8 +14,6 @@ def bf16_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         B: [K, N] BF16 tensor
 
     Returns:
-        C: [M, N] FP32 tensor (A @ B)
+        C: [M, N] BF16 tensor (A @ B)
     """
-    # TODO: Phase 2+ - use custom kernel
-    # For now, use PyTorch as reference
-    return torch.mm(A.float(), B.float())
+    return _bf16_gemm(A, B)
