@@ -61,6 +61,10 @@ def main():
             v2_time = benchmark_fn(lambda: flash_attn_v2_sm120(Q, K, V, causal=True))
             speedup = sdpa_time / v2_time
             print(f"{B:4d} {H:4d} {N:6d} {D:4d} | {sdpa_time:10.3f} {v1_str:>10} {v2_time:10.3f} {speedup:10.2f}x")
+            # Primary config marker for eval.sh
+            if B == 2 and H == 8 and N == 2048 and D == 64:
+                print(f"primary_custom_ms: {v2_time:.3f}")
+                print(f"primary_vs_ref: {speedup:.2f}x")
         except Exception as e:
             print(f"{B:4d} {H:4d} {N:6d} {D:4d} | {sdpa_time:10.3f} {v1_str:>10} {'N/A':>10} {'N/A':>11}  ({e})")
 

@@ -174,6 +174,7 @@ eval.sh                       ← build → test → bench → profile pipeline
 |--------|--------|--------|-----|
 | Flash Attention (BF16) | Optimizing (GPU 1) | ≤56 μs (95% ceiling) | Training bottleneck |
 | BF16 GEMM | Optimizing (GPU 0) | ≤646 μs (95% ceiling) | Linear layers |
+| Multi-GPU Tiled GEMM | Not started | — | CPU-resident matrices, stream tiles to GPUs over PCIe |
 | Flash Attention (FP8) | Not started | — | 2x throughput from wider MMA |
 | Fused MLP | Not started | — | Eliminate memory round-trips |
 | RMSNorm + Attention | Not started | — | Fuse norm into attention |

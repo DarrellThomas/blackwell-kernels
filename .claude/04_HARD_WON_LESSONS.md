@@ -57,6 +57,16 @@ GPU 0 has ComfyUI running. Always use `CUDA_VISIBLE_DEVICES=1`. Forgetting this 
 
 ---
 
+## PTX-First / Manual Scheduling
+
+**B fragment double-buffering does NOT help on sm_120.** Attempted loading B[nt+1] while MMA executes with B[nt] using separate register sets and `asm volatile` ordering. Result: 0.68x cuBLAS (regression from 0.89x). Root cause: 139 registers (vs 123), 0 spills — the extra registers reduce occupancy, and the `asm volatile` barriers prevent the compiler from reordering instructions freely. The hardware warp scheduler (with 8 warps / 256 threads) already overlaps ldmatrix and mma.sync across warps.
+
+**The compiler's `#pragma unroll` scheduling is surprisingly good.** On sm_120, nvcc with `-O2` and `#pragma unroll` produces near-optimal interleaving of MMA and load instructions. Simple PTX double-buffering tricks that work on Ampere (salykova) add overhead here because: (1) more registers → lower occupancy, (2) `asm volatile` constraints fight the compiler's scheduler, (3) the warp scheduler already hides latency across 8 warps.
+
+**To actually beat the compiler, you need a radical approach.** A single large `asm` block with full manual register allocation and instruction scheduling — not incremental PTX additions to a compiler-managed kernel. The salykova approach (writing the entire inner loop in PTX with explicit register naming) is the right idea, but requires committing fully to assembly for the hot path.
+
+---
+
 ## Reference Implementations
 
 **gau-nernst** wrote custom flash attention for RTX 5090 and achieved 94.4% of 209.5 TFLOPS peak using BLOCK_Q=128. This is our feasibility proof — we know sm_120 can get there.

@@ -4,9 +4,10 @@
 # Autokernel evaluation script: build → test → benchmark → profile
 #
 # Usage:
-#   ./eval.sh              # full pipeline (build + test + bench + profile)
-#   ./eval.sh --quick      # skip profiling (build + test + bench only)
-#   ./eval.sh --profile    # profile only (skip build/test/bench)
+#   ./eval.sh                        # attention kernel, full pipeline
+#   ./eval.sh --kernel gemm          # GEMM kernel, full pipeline
+#   ./eval.sh --kernel attention --quick    # attention, skip profiling
+#   ./eval.sh --kernel gemm --profile      # GEMM, profile only
 #
 # All output uses machine-parseable "key: value" lines for the agent to grep.
 # Exit codes: 0 = success, 1 = build fail, 2 = test fail, 3 = bench fail, 4 = profile fail
@@ -14,15 +15,61 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# ─── ARGUMENT PARSING ─────────────────────────────────────────────────────────
+KERNEL="attention"
 MODE="full"
-if [[ "${1:-}" == "--quick" ]]; then MODE="quick"; fi
-if [[ "${1:-}" == "--profile" ]]; then MODE="profile"; fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --kernel)   KERNEL="$2"; shift 2 ;;
+        --quick)    MODE="quick"; shift ;;
+        --profile)  MODE="profile"; shift ;;
+        *)          echo "Unknown arg: $1"; exit 1 ;;
+    esac
+done
+
+# ─── PER-KERNEL CONFIG ────────────────────────────────────────────────────────
+case "$KERNEL" in
+    attention)
+        TEST_SCRIPT="tests/test_attention.py"
+        BENCH_SCRIPT="benchmarks/bench_attention.py"
+        PROFILE_SCRIPT="profiles/profile_v2.py"
+        NCU_KERNEL_NAME="flash_attn_v2_kernel"
+        ;;
+    gemm)
+        TEST_SCRIPT="tests/test_gemm.py"
+        BENCH_SCRIPT="benchmarks/bench_gemm.py"
+        PROFILE_SCRIPT="profiles/profile_gemm.py"
+        NCU_KERNEL_NAME="bf16_gemm_kernel"
+        ;;
+    *)
+        echo "Unknown kernel: $KERNEL"
+        echo "Available kernels: attention, gemm"
+        exit 1
+        ;;
+esac
+
+RESULTS_DIR="results"
+LOG_DIR="logs/${KERNEL}"
+mkdir -p "$RESULTS_DIR" "$LOG_DIR"
 
 export CUDA_VISIBLE_DEVICES=1
 export CUDA_HOME=/usr/local/cuda-13
 export PYTHONPATH=python
 
 NCU="$CUDA_HOME/bin/ncu"
+
+# ─── HEARTBEAT ────────────────────────────────────────────────────────────────
+# Signal dashboard that this kernel's loop is alive.
+# File content = loop start epoch (written once); mtime = last heartbeat.
+HEARTBEAT_FILE=".autokernel.${KERNEL}.alive"
+if [[ -f "$HEARTBEAT_FILE" ]]; then
+    touch "$HEARTBEAT_FILE"
+else
+    date +%s > "$HEARTBEAT_FILE"
+fi
+
+echo "=== KERNEL: $KERNEL ==="
 
 # Key ncu metrics for bottleneck identification
 NCU_METRICS="gpu__time_duration.sum"
@@ -52,7 +99,7 @@ if [[ "$MODE" != "profile" ]]; then
 
     # ─── TEST ──────────────────────────────────────────────────────────────────
     echo "=== TEST ==="
-    if python3 tests/test_attention.py > test.log 2>&1; then
+    if python3 "$TEST_SCRIPT" > test.log 2>&1; then
         echo "test: PASS"
     else
         echo "test: FAIL"
@@ -63,19 +110,18 @@ if [[ "$MODE" != "profile" ]]; then
 
     # ─── BENCHMARK ─────────────────────────────────────────────────────────────
     echo "=== BENCHMARK ==="
-    if python3 benchmarks/bench_attention.py > bench.log 2>&1; then
+    if python3 "$BENCH_SCRIPT" > bench.log 2>&1; then
         echo "bench: PASS"
         cat bench.log
         echo ""
-        # Parse primary config: B=2 H=8 N=2048 D=64
-        # Columns: B H N D | SDPA v1 v2 speedup
-        # awk fields: $1=B $2=H $3=N $4=D $5=| $6=SDPA $7=v1 $8=v2 $9=speedup
-        PRIMARY=$(grep "^\s*2\s\+8\s\+2048\s\+64\b" bench.log | head -1 || true)
-        if [[ -n "$PRIMARY" ]]; then
-            V2_MS=$(echo "$PRIMARY" | awk '{print $8}')
-            SPEEDUP=$(echo "$PRIMARY" | awk '{print $9}' | tr -d 'x')
-            echo "primary_v2_ms: $V2_MS"
-            echo "primary_vs_sdpa: ${SPEEDUP}x"
+        # Parse generic primary metrics (all bench scripts emit these)
+        CUSTOM_MS=$(grep "^primary_custom_ms:" bench.log | awk '{print $2}' || true)
+        VS_REF=$(grep "^primary_vs_ref:" bench.log | awk '{print $2}' | tr -d 'x' || true)
+        if [[ -n "$CUSTOM_MS" ]]; then
+            echo "primary_custom_ms: $CUSTOM_MS"
+        fi
+        if [[ -n "$VS_REF" ]]; then
+            echo "primary_vs_ref: ${VS_REF}x"
         fi
     else
         echo "bench: FAIL"
@@ -93,9 +139,9 @@ if [[ "$MODE" != "quick" ]]; then
     if sudo -E CUDA_VISIBLE_DEVICES=1 "$NCU" \
         --metrics "$NCU_METRICS" \
         --csv \
-        --kernel-name "flash_attn_v2_kernel" \
+        --kernel-name "$NCU_KERNEL_NAME" \
         --launch-count 1 \
-        python3 profiles/profile_v2.py > profile.log 2>&1; then
+        python3 "$PROFILE_SCRIPT" > profile.log 2>&1; then
 
         echo "profile: PASS"
         echo ""
@@ -167,7 +213,7 @@ if stalls:
     print(f'top_bottleneck: {top_name}')
     print(f'top_bottleneck_pct: {top_pct:.1f}')
 
-# TSV-ready summary: matches results.tsv column format exactly
+# TSV-ready summary: matches results/*.tsv column format exactly
 # Agent can grep for 'tsv_' lines and use values directly
 print()
 print('=== TSV-READY SUMMARY ===')

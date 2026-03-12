@@ -1,5 +1,10 @@
-@01_UNIVERSAL_PRINCIPLES.md
 @03_PROJECT_SPECIFICATION.md
+@04_HARD_WON_LESSONS.md
+@../docs/nvidia_blackwell_tuning_guide_sm120.md
+@../docs/cuda_best_practices.md
+@../docs/cuda_programming_guide.md
+@../docs/blackwell_compatibility_guide.md
+@../docs/math_throttle_optimization.md
 
 # blackwell-kernels — Project Principles
 

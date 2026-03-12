@@ -26,7 +26,8 @@ This is a **profile-driven** loop. Unlike blind search, every iteration starts b
 
 LOOP FOREVER:
 
-1. **PROFILE**: Run `./eval.sh > eval.log 2>&1` (full pipeline: build → test → bench → profile).
+1. **HEARTBEAT**: Signal the dashboard that this kernel's loop is active. On the first iteration, write the start time: `date +%s > .autokernel.<kernel>.alive`. On subsequent iterations, just update mtime: `touch .autokernel.<kernel>.alive`. (The file content is the loop start epoch; mtime is the last heartbeat.)
+2. **PROFILE**: Run `./eval.sh > eval.log 2>&1` (full pipeline: build → test → bench → profile).
 2. **READ RESULTS**: `grep -E "^(build|test|bench|profile|primary_|ncu_|top_)" eval.log`
    - If build or test FAIL: read the tail of eval.log, attempt fix (max 3 attempts), then re-run.
    - If bench FAIL: same — read log, attempt fix.
@@ -198,13 +199,32 @@ If recent kept experiments show <2% improvement each, incremental tuning on the 
 
 **Action**: This is NOT a reason to stop. Small gains compound. Keep them. But also start mixing in **bold experiments** alongside incremental ones — alternate between safe micro-optimizations and high-risk structural changes. Try things that might not work. The discard cost is one iteration (~90 seconds).
 
-### When to Actually Stop
+### Halt Criterion: 95% of Theoretical Ceiling
 
-**Only stop when the human interrupts you (Ctrl+C) or you literally cannot think of anything new to try after exhausting all of the following:**
+The optimization loop targets **95% of the achievable theoretical ceiling** for each kernel. These ceilings come from roofline analysis in `docs/theoretical_limits.md`:
+
+| Kernel | Achievable Ceiling | 95% Target | Hard Floor |
+|--------|-------------------|------------|------------|
+| **Attention** (B=2 H=8 N=2048 D=64 causal) | ~53 μs | **≤56 μs** | 38 μs |
+| **GEMM** (M=N=K=4096 BF16) | ~614 μs | **≤646 μs** | 614 μs |
+
+The dashboard's "vs Theory" card tracks this in real time.
+
+**When to actually stop:**
+
+1. **Target reached**: Duration ≤ 95% target. Write convergence report and notify the human.
+2. **90% reached + exhausted**: If you reach 90% of ceiling and stall for **10+ consecutive iterations** with all structural approaches below exhausted — the ceiling estimate may be wrong. Update the ceiling in `docs/theoretical_limits.md`, write convergence report, notify the human.
+3. **Human interrupts** (Ctrl+C).
+
+**The ceiling estimates are living numbers.** As you learn more about the hardware through optimization, update them. If a structural discovery reveals the real ceiling is different, adjust `docs/theoretical_limits.md` AND the `KERNEL_CONFIG` in `dashboard.py`.
+
+### Before Stopping: Exhaust These Approaches
+
+Do NOT stop until you've tried all of the following:
 
 1. Re-read the profiler output from scratch — look at metrics you haven't focused on
-2. Re-read the reference docs (`docs/*.md`) for techniques you haven't tried yet
-3. Re-read the CUDA best practices and programming guide for applicable patterns
+2. Re-read `docs/theoretical_limits.md` for the gap analysis and where headroom lives
+3. Re-read the reference docs (`docs/*.md`) for techniques you haven't tried yet
 4. Study reference implementations (gau-nernst uses BLOCK_Q=128, 94.4% peak)
 5. Combine two previous near-miss optimizations that were each discarded individually
 6. Try the opposite of what you've been doing (if you've been reducing shared memory, try using more)
@@ -214,17 +234,20 @@ If recent kept experiments show <2% improvement each, incremental tuning on the 
 10. Try coalescing patterns you haven't explored (stores, loads, different vector widths)
 11. Revisit a previously discarded idea with a twist
 
-If you truly exhaust all of these, write a convergence report to `results_summary.md` with final metrics, what worked, what didn't, and remaining bottleneck analysis. Then notify the human.
+If you truly exhaust all of these AND meet the halt criterion above, write a convergence report to `results_summary.md` with final metrics, what worked, what didn't, and remaining bottleneck analysis. Then notify the human.
 
 ### Reference Ceiling
 
-From the tuning guide and reference implementations:
-- **cuDNN SDPA**: 97.2% of peak TFLOPS (the bar to beat)
-- **gau-nernst custom FA**: 94.4% of 209.5 TFLOPS peak on sm_120
-- **Peak BF16**: 209.5 TFLOPS → for our config (B=2 H=8 N=2048 D=64), theoretical min duration ≈ X us
-- Even at >90% tensor pipe utilization, there may still be gains from reducing overhead, improving scheduling, or restructuring the compute/load balance.
+From the tuning guide, reference implementations, and our roofline analysis:
+- **RTX 5090 sustained BF16 peak**: ~224 TFLOPS (verified via cuBLAS at 99.9%)
+- **cuDNN SDPA**: 97.2% of peak on large configs (slower than our kernel on small configs)
+- **gau-nernst custom FA**: 94.4% of 209.5 TFLOPS peak on sm_120 with BLOCK_Q=128
+- **cuBLAS GEMM**: 99.9% of sustained peak on M=N=K=4096 — effectively at the physical limit
+- **Attention hard floor**: 38 μs (tensor math only, unreachable due to softmax serialization)
+- **Attention achievable ceiling**: ~53 μs (~70% tensor utilization, accounting for fundamental overheads)
+- **GEMM achievable ceiling**: 614 μs (= cuBLAS, = physical limit)
 
-Always keep the docs in `docs/` in mind — they contain optimization techniques and hardware constraints that may inspire new approaches.
+Always keep `docs/theoretical_limits.md` and `docs/*.md` in mind — they contain the full analysis and may inspire new approaches.
 
 ## Autonomous Operation
 
