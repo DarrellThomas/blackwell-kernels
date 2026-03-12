@@ -5,6 +5,7 @@
 @../docs/cuda_programming_guide.md
 @../docs/blackwell_compatibility_guide.md
 @../docs/math_throttle_optimization.md
+@../docs/attention_agent_state.md
 
 # blackwell-kernels — Project Principles
 

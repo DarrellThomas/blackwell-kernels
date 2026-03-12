@@ -11,14 +11,15 @@
 set -euo pipefail
 
 # --- Configuration ---
-MAX_ITERS=20                    # Clear after this many new iterations
+MAX_ITERS=1                     # Clear after every iteration (fresh context each cycle)
 STALL_TIMEOUT=2700              # Restart if no new iteration in N seconds (45 min)
 CHECK_INTERVAL=120              # Check every N seconds
 RESTART_PAUSE=5                 # Seconds between clear and restart
 
 # Loop definitions: name|tmux_session|tsv_file|autokernel_cmd
 LOOPS=(
-    "gemm|autokernel-gemm|/data/src/blackwell-kernels-gemm/results/gemm.tsv|/autokernel gemm mar12"
+    "gemm|gemm|../gemm/results/gemm.tsv|/autokernel gemm mar12"
+    "attention|attention|results/attention.tsv|/autokernel attention mar12"
 )
 
 # --- State tracking ---

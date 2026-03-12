@@ -163,8 +163,7 @@ docs/
 .claude/
   04_HARD_WON_LESSONS.md      ← empirical knowledge (the good stuff)
   CLAUDE.md                   ← agent context (MMA register layout, build commands)
-program.md                    ← autonomous loop instructions
-dashboard.py                  ← live optimization dashboard (http://localhost:8420)
+program_attention.md          ← attention optimization loop instructions
 eval.sh                       ← build → test → bench → profile pipeline
 ```
 

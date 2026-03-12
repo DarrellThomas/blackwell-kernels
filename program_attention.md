@@ -12,10 +12,12 @@ To set up a new optimization run, work with the user to:
    - `.claude/CLAUDE.md` — project principles, build commands, MMA register layout.
    - `.claude/03_PROJECT_SPECIFICATION.md` — kernel specs, API, phases.
    - `.claude/04_HARD_WON_LESSONS.md` — current bottleneck profile, completed and remaining optimizations.
+   - `docs/attention_agent_state.md` — current best numbers, diagnosis, and next directions.
    - `docs/nvidia_blackwell_tuning_guide_sm120.md` — sm_120 hardware limits (shared memory, registers, occupancy).
+   - `docs/math_throttle_optimization.md` — math_pipe_throttle diagnosis and strategies.
    - `csrc/attention/flash_attn_v2_sm120.cu` — the kernel you optimize.
    - `csrc/common/*.cuh` — shared primitives (mma, ldmatrix, cp_async, swizzle).
-4. **Run baseline**: `./eval.sh > eval.log 2>&1`, then extract results. Record as baseline in `results.tsv`.
+4. **Run baseline**: `./eval.sh --kernel attention > eval.log 2>&1`, then extract results. Record as baseline in `results/attention.tsv`.
 5. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the optimization loop.
@@ -27,7 +29,7 @@ This is a **profile-driven** loop. Unlike blind search, every iteration starts b
 LOOP FOREVER:
 
 1. **HEARTBEAT**: Signal the dashboard that this kernel's loop is active. On the first iteration, write the start time: `date +%s > .autokernel.<kernel>.alive`. On subsequent iterations, just update mtime: `touch .autokernel.<kernel>.alive`. (The file content is the loop start epoch; mtime is the last heartbeat.)
-2. **PROFILE**: Run `./eval.sh > eval.log 2>&1` (full pipeline: build → test → bench → profile).
+2. **PROFILE**: Run `./eval.sh --kernel attention > eval.log 2>&1` (full pipeline: build → test → bench → profile).
 2. **READ RESULTS**: `grep -E "^(build|test|bench|profile|primary_|ncu_|top_)" eval.log`
    - If build or test FAIL: read the tail of eval.log, attempt fix (max 3 attempts), then re-run.
    - If bench FAIL: same — read log, attempt fix.
@@ -45,18 +47,25 @@ LOOP FOREVER:
    | `bank_conflicts_store` / `bank_conflicts_load` | Shared memory bank conflicts | Apply XOR swizzle, pad shared memory, restructure access patterns |
 
 4. **DESIGN FIX**: Based on the bottleneck analysis, design a targeted optimization. Consult:
+   - `docs/attention_agent_state.md` for current diagnosis and direction
+   - `.claude/04_HARD_WON_LESSONS.md` for dead ends — **do not retry anything listed there**
    - `docs/nvidia_blackwell_tuning_guide_sm120.md` for hardware limits
-   - `.claude/04_HARD_WON_LESSONS.md` for previously planned optimizations
+   - `docs/math_throttle_optimization.md` if math_throttle is dominant
    - The kernel source for current structure
 5. **IMPLEMENT**: Modify kernel source files. Keep changes focused — one optimization per iteration.
 6. **COMMIT**: `git commit -m "autokernel: <short description of optimization>"`
-7. **EVALUATE**: Run `./eval.sh > eval.log 2>&1` again. Extract results.
+7. **EVALUATE**: Run `./eval.sh --kernel attention > eval.log 2>&1` again. Extract results.
 8. **DECIDE**:
    - If `primary_vs_sdpa` improved (higher) AND tests pass → **KEEP** the commit.
    - If `primary_vs_sdpa` is worse or equal → `git reset --hard HEAD~1` (discard).
    - If tests fail but the idea is sound → attempt fix (max 3 tries), else discard.
-9. **RECORD**: Log results to `results.tsv` (see format below).
-10. **LOOP**: Go to step 1. The new profile will reveal a new #1 bottleneck.
+9. **RECORD**: Log results to `results/attention.tsv` (see format below).
+10. **UPDATE STATE**: Update `docs/attention_agent_state.md` with:
+    - Current best (commit, duration, vs SDPA ratio, top stall)
+    - Updated diagnosis if the bottleneck profile changed
+    - Any new direction insights from this iteration
+    This file is the persistent memory across context clears — the watchdog flushes context after every cycle. If you don't write it back here, the next cycle wakes up with stale state.
+11. **LOOP**: Go to step 1. The new profile will reveal a new #1 bottleneck.
 
 ## What You CAN Modify
 
@@ -149,13 +158,13 @@ Also preserve **per-iteration logs**: after each eval run, copy eval.log to `log
 
 ```bash
 # Full evaluation (build + test + bench + profile)
-./eval.sh > eval.log 2>&1
+./eval.sh --kernel attention > eval.log 2>&1
 
 # Quick check (no profiling, faster)
-./eval.sh --quick > eval.log 2>&1
+./eval.sh --kernel attention --quick > eval.log 2>&1
 
 # Profile only (skip build/test/bench)
-./eval.sh --profile > eval.log 2>&1
+./eval.sh --kernel attention --profile > eval.log 2>&1
 
 # Extract key results
 grep -E "^(build|test|bench|profile|primary_|ncu_|top_)" eval.log
@@ -257,4 +266,4 @@ Once the optimization loop has begun, do NOT pause to ask the human if you shoul
 
 ## Scope
 
-This is a test run to validate the autokernel loop on the existing flash attention v2 kernel. The broader goal is to build a library of optimized kernels (GEMM, fused ops, FP8), each going through this same profile-driven optimization loop. The infrastructure (`eval.sh`, `program.md`, `results.tsv` format) is being designed to generalize to future kernels.
+This is a test run to validate the autokernel loop on the existing flash attention v2 kernel. The broader goal is to build a library of optimized kernels (GEMM, fused ops, FP8), each going through this same profile-driven optimization loop. The infrastructure (`eval.sh`, per-kernel program files, `results/<kernel>.tsv` format) is designed to generalize to future kernels.
