@@ -1,25 +1,37 @@
 # blackwell-kernels
 
-Custom CUDA kernels for the RTX 5090 — because NVIDIA gave us an amazing GPU and then forgot to ship the software for it.
+Custom CUDA kernels for the RTX 5090 (sm_120) — hand-optimized for a GPU that deserves better software.
 
-## The Problem
+## Why This Exists
 
-The RTX 5090 (sm_120, consumer Blackwell) has a different tensor core ISA than its datacenter sibling. Datacenter Blackwell (sm_100) uses `tcgen05` and gets Flash Attention 3, Flash Attention 4, CUTLASS fused attention, and the full optimized kernel ecosystem. Consumer Blackwell uses `mma.sync` and gets... `cuDNN.`
+The RTX 5090 (sm_120, consumer Blackwell) has a different tensor core ISA than its datacenter sibling. Datacenter Blackwell (sm_100) uses `tcgen05` and gets Flash Attention 3/4, CUTLASS fused attention, and the full optimized kernel ecosystem. Consumer Blackwell uses `mma.sync` and gets cuDNN — which is good, but leaves performance on the table.
 
-Flash Attention 3 will never compile on this chip. Flash Attention 4 won't either. CUTLASS examples target `tcgen05`. If you're training models on an RTX 5090, you're leaving performance on the table because nobody has written optimized kernels for your specific hardware.
+This isn't an oversight. NVIDIA made a rational engineering decision: large-scale training happens on H100s and H200s, not consumer GPUs. The investment in optimizing datacenter kernels has far higher ROI than optimizing for someone training on a 5090 in their office. Anyone doing serious distributed training is using datacenter hardware. Fair enough.
 
-So we wrote our own.
+But there *are* real use cases where optimized sm_120 kernels matter:
+
+- **Personal research and experimentation** — researchers running small-scale training loops, hyperparameter sweeps, or proof-of-concept models on local hardware before scaling to cloud
+- **Fine-tuning** — LoRA, QLoRA, and other parameter-efficient methods that fit in 32GB GDDR7
+- **Inference** — serving local models where every millisecond of latency matters
+- **AI-assisted development loops** — like [autoresearch](https://github.com/karpathy/autoresearch), where fast local iteration lets you explore more ideas per hour
+- **Learning** — understanding GPU architecture by writing kernels from scratch, with hardware you can profile unrestricted (no cloud quotas, no shared machines)
+
+The 5090 has 209.5 TFLOPS of BF16 tensor throughput. That's real compute sitting there. We're here to use it.
 
 ## What's Here
 
 **Flash Attention** — a from-scratch implementation using `mma.sync.aligned.m16n8k16` tensor core instructions, built specifically for sm_120. Not a port of FA2/FA3 — a ground-up design informed by weeks of empirical testing of the register layout, ldmatrix behavior, and MMA fragment packing on this specific GPU.
 
-Current performance (B=2, H=8, N=2048, D=64, causal):
-- **1.61x faster** than cuDNN SDPA
-- **98.8 us** kernel duration
-- **57.2%** SM throughput (and climbing)
+**BF16 GEMM** — a tiled matrix multiply using the same `mma.sync` instructions, with double-buffered shared memory, cp.async pipelining, and XOR swizzle for bank conflict elimination.
 
-The kernel is still being actively optimized by an autonomous optimization loop (more on that below).
+Current performance:
+
+| Kernel | Config | Duration | vs Reference | vs Theoretical Ceiling |
+|--------|--------|----------|-------------|----------------------|
+| Flash Attention | B=2 H=8 N=2048 D=64 causal | 98.8 μs | **1.61x cuDNN SDPA** | 54% of achievable ceiling |
+| BF16 GEMM | M=N=K=4096 | 788 μs | **0.78x cuBLAS** | 78% of achievable ceiling |
+
+Both kernels are actively being optimized by autonomous optimization loops running on two GPUs in parallel (more on that below).
 
 ## Background
 
@@ -131,8 +143,10 @@ The `/autokernel` skill handles everything — starts the dashboard, creates a b
 ```
 csrc/
   attention/
-    flash_attn_v2_sm120.cu    ← the kernel (this is where the magic happens)
+    flash_attn_v2_sm120.cu    ← flash attention kernel (MMA tensor core)
     flash_attn_sm120.cu       ← v1 scalar reference
+  gemm/
+    bf16_gemm_sm120.cu        ← BF16 GEMM kernel
   common/
     mma_sm120.cuh             ← mma.sync wrappers
     ldmatrix.cuh              ← shared→register helpers
@@ -142,26 +156,29 @@ python/
   blackwell_kernels/          ← Python bindings
 tests/                        ← correctness tests (Python + standalone CUDA)
 benchmarks/                   ← benchmark harness
-docs/                         ← curated CUDA reference docs
+docs/
+  theoretical_limits.md       ← roofline analysis & achievable ceilings
+  nvidia_blackwell_tuning_guide_sm120.md
+  cuda_best_practices.md
 .claude/
   04_HARD_WON_LESSONS.md      ← empirical knowledge (the good stuff)
   CLAUDE.md                   ← agent context (MMA register layout, build commands)
 program.md                    ← autonomous loop instructions
-dashboard.py                  ← live optimization dashboard
+dashboard.py                  ← live optimization dashboard (http://localhost:8420)
 eval.sh                       ← build → test → bench → profile pipeline
 ```
 
 ## Kernel Roadmap
 
-| Kernel | Status | Why |
-|--------|--------|-----|
-| Flash Attention (BF16) | Optimizing | Training bottleneck |
-| BF16 GEMM | Stub exists | Linear layers |
-| Flash Attention (FP8) | Not started | 2x throughput from wider MMA |
-| Fused MLP | Not started | Eliminate memory round-trips |
-| RMSNorm + Attention | Not started | Fuse norm into attention |
+| Kernel | Status | Target | Why |
+|--------|--------|--------|-----|
+| Flash Attention (BF16) | Optimizing (GPU 1) | ≤56 μs (95% ceiling) | Training bottleneck |
+| BF16 GEMM | Optimizing (GPU 0) | ≤646 μs (95% ceiling) | Linear layers |
+| Flash Attention (FP8) | Not started | — | 2x throughput from wider MMA |
+| Fused MLP | Not started | — | Eliminate memory round-trips |
+| RMSNorm + Attention | Not started | — | Fuse norm into attention |
 
-Each new kernel goes through the same two-phase process: get it correct (human-guided), then make it fast (autonomous loop). The primitives in `csrc/common/` and the hard-won lessons carry forward — each kernel starts further ahead than the last.
+Each new kernel goes through the same two-phase process: get it correct (human-guided), then make it fast (autonomous loop). The primitives in `csrc/common/` and the hard-won lessons carry forward — each kernel starts further ahead than the last. Once we crack the scheduling and tiling for attention, those structural insights apply to every future kernel on this ISA.
 
 ## Contributing
 
@@ -177,7 +194,7 @@ If you discover something new about sm_120's behavior, add it to `.claude/04_HAR
 
 **[gau-nernst](https://github.com/gau-nernst)** — for demonstrating that 94.4% of peak TFLOPS is achievable on sm_120 with custom flash attention, proving the feasibility of this approach.
 
-**NVIDIA** — for building a beast of a GPU. We just wish the kernel ecosystem had shipped with it. Consider this our contribution to closing that gap.
+**NVIDIA** — for building a beast of a GPU. The RTX 5090 has extraordinary hardware — 209.5 TFLOPS of BF16 tensor compute, 1,792 GB/s of memory bandwidth — and we understand why the optimized kernel investment went to the datacenter. Consider this our contribution to unlocking the consumer side.
 
 ## License
 
