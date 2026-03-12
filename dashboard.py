@@ -8,38 +8,77 @@ Usage:
     python3 dashboard.py 9000         # custom port
 
 Then open http://localhost:8420 in a browser.
-Auto-refreshes every 30 seconds. Reads results.tsv on each request.
+Auto-refreshes every 30 seconds. Reads results/<kernel>.tsv on each request.
 """
 
 import csv
 import json
-import subprocess
+import os
 import sys
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8420
 PROJECT_DIR = Path(__file__).parent
-RESULTS_FILE = PROJECT_DIR / "results.tsv"
+RESULTS_DIR = PROJECT_DIR / "results"
 
 STALL_COLUMNS = ["stall_math", "stall_wait", "stall_scoreboard", "stall_barrier"]
 
-# Vertical annotation markers on charts. Each entry is (iteration_index, label).
-# Add new markers here when significant context changes happen mid-run.
-MARKERS = [
-    (19, "Added CUDA docs to context"),
-]
+# Per-kernel configuration
+KERNEL_CONFIG = {
+    "attention": {
+        "ref_label": "vs cuDNN SDPA",
+        "ref_column": "vs_sdpa",
+        "ref_target": 1.5,
+        "gpu": 1,
+        "markers": [
+            (19, "Added CUDA docs to context"),
+        ],
+    },
+    "gemm": {
+        "ref_label": "vs cuBLAS",
+        "ref_column": "vs_ref",
+        "ref_target": 1.0,
+        "gpu": 0,
+        "markers": [],
+    },
+}
+
+DEFAULT_KERNEL_CONFIG = {
+    "ref_label": "vs Reference",
+    "ref_column": "vs_ref",
+    "ref_target": 1.0,
+    "markers": [],
+}
 
 
-def read_results():
-    """Parse results.tsv into a list of dicts."""
-    if not RESULTS_FILE.exists():
+def list_kernels():
+    """List available kernels from results/ directory."""
+    if not RESULTS_DIR.exists():
+        return []
+    kernels = []
+    for f in sorted(RESULTS_DIR.glob("*.tsv")):
+        kernels.append(f.stem)
+    return kernels
+
+
+def read_results(kernel="attention"):
+    """Parse results/<kernel>.tsv into a list of dicts."""
+    results_file = RESULTS_DIR / f"{kernel}.tsv"
+    # Backwards compat: check old results.tsv location
+    if not results_file.exists():
+        results_file = PROJECT_DIR / "results.tsv"
+    if not results_file.exists():
         return []
     rows = []
-    with open(RESULTS_FILE) as f:
+    config = KERNEL_CONFIG.get(kernel, DEFAULT_KERNEL_CONFIG)
+    ref_col = config["ref_column"]
+    with open(results_file) as f:
         reader = csv.DictReader(f, delimiter="\t")
         for row in reader:
-            for key in ["duration_us", "vs_sdpa", "sm_pct"] + STALL_COLUMNS:
+            for key in ["duration_us", ref_col, "vs_sdpa", "vs_ref", "sm_pct"] + STALL_COLUMNS:
                 try:
                     row[key] = float(row.get(key, 0))
                 except (ValueError, TypeError):
@@ -49,27 +88,62 @@ def read_results():
     return rows
 
 
-def is_loop_running():
-    """Check if the autokernel tmux session is alive."""
+KERNEL_HEARTBEATS = {
+    "attention": PROJECT_DIR / ".autokernel.alive",
+    "gemm": Path("/data/src/blackwell-kernels-gemm/.autokernel.alive"),
+}
+
+
+def is_loop_running(kernel):
+    """Check if a kernel's optimization loop is active via heartbeat file.
+
+    The loop touches .autokernel.alive each iteration. If mtime < 10 min, it's running.
+    """
+    heartbeat = KERNEL_HEARTBEATS.get(kernel)
+    if not heartbeat or not heartbeat.exists():
+        return False
     try:
-        result = subprocess.run(
-            ["tmux", "has-session", "-t", "autokernel"],
-            capture_output=True, timeout=2,
-        )
-        return result.returncode == 0
-    except Exception:
+        age = time.time() - heartbeat.stat().st_mtime
+        return age < 900  # 15 minutes
+    except OSError:
         return False
 
 
-def get_api_data():
+def get_all_loop_status():
+    """Return loop running status for all known kernels."""
+    status = {}
+    for kernel, config in KERNEL_CONFIG.items():
+        gpu = config.get("gpu", "?")
+        status[kernel] = {
+            "running": is_loop_running(kernel),
+            "gpu": gpu,
+        }
+    return status
+
+
+def get_api_data(kernel="attention"):
     """Build JSON payload for the dashboard."""
-    rows = read_results()
+    rows = read_results(kernel)
+    config = KERNEL_CONFIG.get(kernel, DEFAULT_KERNEL_CONFIG)
+    ref_col = config["ref_column"]
+
     if not rows:
-        return {"rows": [], "summary": {}}
+        return {
+            "rows": [], "summary": {}, "kernel": kernel,
+            "config": config, "markers": [],
+            "loop_status": get_all_loop_status(),
+        }
 
     kept = [r for r in rows if r.get("status") == "keep"]
     best = min(kept, key=lambda r: r["duration_us"]) if kept else rows[0]
     latest = rows[-1]
+
+    best_vs_ref = best.get(ref_col, best.get("vs_sdpa", best.get("vs_ref", 0)))
+    if isinstance(best_vs_ref, str):
+        try:
+            best_vs_ref = float(best_vs_ref)
+        except ValueError:
+            best_vs_ref = 0.0
 
     summary = {
         "total_iterations": len(rows),
@@ -77,11 +151,11 @@ def get_api_data():
         "discarded": len([r for r in rows if r.get("status") == "discard"]),
         "crashed": len([r for r in rows if r.get("status") == "crash"]),
         "best_duration_us": best["duration_us"],
-        "best_vs_sdpa": best["vs_sdpa"],
+        "best_vs_ref": best_vs_ref,
         "best_sm_pct": best["sm_pct"],
         "best_commit": best.get("commit", ""),
         "baseline_duration_us": rows[0]["duration_us"] if rows else 0,
-        "baseline_vs_sdpa": rows[0]["vs_sdpa"] if rows else 0,
+        "baseline_vs_ref": rows[0].get(ref_col, rows[0].get("vs_sdpa", rows[0].get("vs_ref", 0))) if rows else 0,
         "current_top_stall": latest.get("top_stall", ""),
         "latest_stalls": {col: latest.get(col, 0) for col in STALL_COLUMNS},
     }
@@ -89,8 +163,10 @@ def get_api_data():
     return {
         "rows": rows,
         "summary": summary,
-        "loop_running": is_loop_running(),
-        "markers": [{"iteration": i, "label": l} for i, l in MARKERS],
+        "kernel": kernel,
+        "config": config,
+        "loop_status": get_all_loop_status(),
+        "markers": [{"iteration": i, "label": l} for i, l in config.get("markers", [])],
     }
 
 
@@ -104,7 +180,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; background: #0d1117; color: #c9d1d9; padding: 20px; }
-  h1 { font-size: 18px; color: #58a6ff; margin-bottom: 4px; }
+  h1 { font-size: 18px; color: #58a6ff; margin-bottom: 4px; display: inline-block; }
+  .header-row { display: flex; align-items: center; gap: 16px; margin-bottom: 4px; }
+  .kernel-select { background: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 4px 10px; font-family: inherit; font-size: 13px; cursor: pointer; }
+  .kernel-select:focus { outline: none; border-color: #58a6ff; }
   .subtitle { font-size: 12px; color: #484f58; margin-bottom: 20px; }
   .cards { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
   .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; min-width: 150px; flex: 1; }
@@ -139,7 +218,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
 
-<h1>autokernel dashboard <span class="loop-status" id="loopStatus"></span></h1>
+<div class="header-row">
+  <h1>autokernel dashboard</h1>
+  <select class="kernel-select" id="kernelSelect" onchange="switchKernel(this.value)">
+    <option value="attention">attention</option>
+  </select>
+  <span id="loopStatusAll" style="display:inline-flex;align-items:center;gap:14px;margin-left:12px;font-size:12px;font-family:monospace"></span>
+</div>
 <div class="subtitle" id="subtitle"></div>
 
 <div class="cards" id="cards"></div>
@@ -150,8 +235,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <canvas id="chartDuration"></canvas>
   </div>
   <div class="chart-box">
-    <h2>vs cuDNN SDPA &mdash; higher is better</h2>
-    <canvas id="chartSdpa"></canvas>
+    <h2 id="refChartTitle">vs Reference &mdash; higher is better</h2>
+    <canvas id="chartRef"></canvas>
   </div>
   <div class="chart-box">
     <h2>SM Throughput %</h2>
@@ -170,7 +255,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <h2 style="font-size: 13px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px;">Experiment Log (newest first)</h2>
 <table>
   <thead>
-    <tr><th>#</th><th>Commit</th><th>Duration</th><th>vs SDPA</th><th>SM %</th><th>Top Stall</th><th>Status</th><th>Description</th></tr>
+    <tr><th>#</th><th>Commit</th><th>Duration</th><th id="refColHeader">vs Ref</th><th>SM %</th><th>Top Stall</th><th>Status</th><th>Description</th></tr>
   </thead>
   <tbody id="logBody"></tbody>
 </table>
@@ -194,14 +279,14 @@ const chartDefaults = {
 };
 
 let charts = {};
-let _rows = [];  // stash for tooltip access
-let _markers = [];  // annotation markers
+let _rows = [];
+let _markers = [];
+let _config = {};
+let _currentKernel = 'attention';
 
 function buildAnnotations(rows) {
   const annot = {};
   _markers.forEach((m, i) => {
-    // Find the x-axis position: markers use iteration index
-    // Only show if we have enough rows
     if (m.iteration >= rows.length) return;
     annot['marker' + i] = {
       type: 'line',
@@ -231,15 +316,21 @@ function makeChart(id, config) {
   charts[id] = new Chart(ctx, config);
 }
 
-// W&B-style tooltip: shows experiment details on hover
+function getRefValue(row) {
+  const col = _config.ref_column || 'vs_sdpa';
+  return row[col] || row.vs_sdpa || row.vs_ref || 0;
+}
+
 function experimentTooltip(context) {
   const idx = context[0]?.dataIndex;
   if (idx == null || !_rows[idx]) return '';
   const r = _rows[idx];
+  const refLabel = _config.ref_label || 'vs Ref';
+  const refVal = getRefValue(r);
   const lines = [
     `#${r.iteration}  ${r.commit || ''}  [${r.status}]`,
     `Duration: ${typeof r.duration_us === 'number' ? r.duration_us.toFixed(1) : r.duration_us} us`,
-    `vs SDPA: ${typeof r.vs_sdpa === 'number' ? r.vs_sdpa.toFixed(2) + 'x' : r.vs_sdpa}`,
+    `${refLabel}: ${typeof refVal === 'number' ? refVal.toFixed(2) + 'x' : refVal}`,
     `SM: ${typeof r.sm_pct === 'number' ? r.sm_pct.toFixed(1) : r.sm_pct}%`,
     `Top stall: ${(r.top_stall || '').replace(/_/g, ' ')}`,
     ``,
@@ -267,7 +358,9 @@ function renderCards(s) {
   const improvement = s.baseline_duration_us > 0
     ? ((s.baseline_duration_us - s.best_duration_us) / s.baseline_duration_us * 100).toFixed(1)
     : 0;
-  const sdpaClass = s.best_vs_sdpa >= 1.0 ? 'good' : 'warn';
+  const refLabel = _config.ref_label || 'vs Reference';
+  const refTarget = _config.ref_target || 1.0;
+  const refClass = s.best_vs_ref >= refTarget ? 'good' : 'warn';
   const stallLabel = (s.current_top_stall || 'n/a').replace(/_/g, ' ');
 
   document.getElementById('cards').innerHTML = `
@@ -282,9 +375,9 @@ function renderCards(s) {
       <div class="sub">${improvement}% faster than baseline</div>
     </div>
     <div class="card">
-      <div class="label">vs cuDNN SDPA</div>
-      <div class="value ${sdpaClass}">${s.best_vs_sdpa.toFixed(2)}x</div>
-      <div class="sub">target: &gt;1.50x</div>
+      <div class="label">${refLabel}</div>
+      <div class="value ${refClass}">${s.best_vs_ref.toFixed(2)}x</div>
+      <div class="sub">target: &gt;${refTarget.toFixed(1)}x</div>
     </div>
     <div class="card">
       <div class="label">SM Throughput</div>
@@ -352,7 +445,6 @@ function renderStallBar(stalls) {
 
 function renderStallEvolution(rows) {
   const keys = Object.keys(STALL_META);
-  // Normalize so all 4 categories sum to 100% at each iteration
   const normalized = rows.map(r => {
     const total = keys.reduce((s, k) => s + (r[k] || 0), 0);
     const result = {};
@@ -397,12 +489,13 @@ function renderTable(rows) {
     const mark = markerSet.has(r.iteration)
       ? `<span title="${markerMap[r.iteration]}" style="cursor:help;color:#8b949e;margin-left:4px">|</span>`
       : '';
+    const refVal = getRefValue(r);
     return `
     <tr class="${r.status}">
       <td>${r.iteration}${mark}</td>
       <td><code>${r.commit || ''}</code></td>
       <td>${typeof r.duration_us === 'number' ? r.duration_us.toFixed(1) : r.duration_us}</td>
-      <td>${typeof r.vs_sdpa === 'number' ? r.vs_sdpa.toFixed(2) + 'x' : r.vs_sdpa}</td>
+      <td>${typeof refVal === 'number' ? refVal.toFixed(2) + 'x' : refVal}</td>
       <td>${typeof r.sm_pct === 'number' ? r.sm_pct.toFixed(1) : r.sm_pct}%</td>
       <td>${(r.top_stall || '').replace(/_/g, ' ')}</td>
       <td><span class="status-${r.status}">${r.status}</span></td>
@@ -411,33 +504,77 @@ function renderTable(rows) {
   }).join('');
 }
 
+function switchKernel(kernel) {
+  _currentKernel = kernel;
+  // Update URL without reload
+  const url = new URL(window.location);
+  url.searchParams.set('kernel', kernel);
+  history.replaceState(null, '', url);
+  refresh();
+}
+
+const GPU_LABELS = { attention: 'GPU1', gemm: 'GPU0' };
+
+async function loadKernels() {
+  try {
+    const resp = await fetch('/api/kernels');
+    const kernels = await resp.json();
+    const sel = document.getElementById('kernelSelect');
+    sel.innerHTML = kernels.map(k => {
+      const gpu = GPU_LABELS[k] || '';
+      const label = gpu ? `${k} (${gpu})` : k;
+      return `<option value="${k}" ${k === _currentKernel ? 'selected' : ''}>${label}</option>`;
+    }).join('');
+  } catch (e) {
+    console.error('Failed to load kernels:', e);
+  }
+}
+
+function renderLoopStatus(loopStatus) {
+  const el = document.getElementById('loopStatusAll');
+  if (!loopStatus) { el.innerHTML = ''; return; }
+  const sorted = Object.entries(loopStatus).sort((a, b) => a[1].gpu - b[1].gpu);
+  el.innerHTML = sorted.map(([kernel, info]) => {
+    const running = info.running;
+    const dotClass = running ? 'running' : 'stopped';
+    const color = running ? '#3fb950' : '#f85149';
+    const label = running ? 'running' : 'stopped';
+    return `<span style="display:inline-flex;align-items:center;gap:4px"><span class="loop-dot ${dotClass}"></span><span style="color:${color}">loop ${info.gpu} ${label}</span></span>`;
+  }).join('');
+}
+
 async function refresh() {
   try {
-    const resp = await fetch('/api/data');
+    const resp = await fetch(`/api/data?kernel=${_currentKernel}`);
     const data = await resp.json();
     const { rows, summary } = data;
 
+    _config = data.config || {};
+    _rows = rows;
+    _markers = data.markers || [];
+
+    const refLabel = _config.ref_label || 'vs Reference';
+    document.getElementById('refChartTitle').textContent = `${refLabel} — higher is better`;
+    document.getElementById('refColHeader').textContent = refLabel;
+
     document.getElementById('subtitle').textContent =
+      `${_currentKernel} kernel \u2022 ` +
       'Last refreshed: ' + new Date().toLocaleTimeString() + ' \u2022 auto-refreshes every 30s';
 
+    renderLoopStatus(data.loop_status);
+
     if (!rows || rows.length === 0) {
-      document.getElementById('cards').innerHTML = '<div class="no-data">Waiting for first experiment result in results.tsv...</div>';
+      document.getElementById('cards').innerHTML = `<div class="no-data">Waiting for first experiment result in results/${_currentKernel}.tsv...</div>`;
       return;
     }
 
-    _rows = rows;  // stash for tooltip access
-    _markers = data.markers || [];
-
-    const running = data.loop_running;
-    document.getElementById('loopStatus').innerHTML = running
-      ? '<span class="loop-dot running"></span><span style="color:#3fb950">loop running</span>'
-      : '<span class="loop-dot stopped"></span><span style="color:#f85149">loop stopped</span>';
-
     renderCards(summary);
     renderLineChart('chartDuration', 'Duration (us)', '#58a6ff', rows, r => r.duration_us);
-    renderLineChart('chartSdpa', 'vs SDPA', '#3fb950', rows, r => r.vs_sdpa, [{
-      label: 'Target (1.5x)',
-      data: rows.map(() => 1.5),
+
+    const refTarget = _config.ref_target || 1.0;
+    renderLineChart('chartRef', refLabel, '#3fb950', rows, r => getRefValue(r), [{
+      label: `Target (${refTarget.toFixed(1)}x)`,
+      data: rows.map(() => refTarget),
       borderColor: '#f8514940',
       borderDash: [6, 4],
       pointRadius: 0,
@@ -452,8 +589,14 @@ async function refresh() {
   }
 }
 
+// Read kernel from URL on load
+const params = new URLSearchParams(window.location.search);
+if (params.has('kernel')) _currentKernel = params.get('kernel');
+
+loadKernels();
 refresh();
 setInterval(refresh, 30000);
+setInterval(loadKernels, 60000);
 </script>
 </body>
 </html>"""
@@ -461,8 +604,22 @@ setInterval(refresh, 30000);
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/api/data":
-            data = get_api_data()
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+
+        if parsed.path == "/api/kernels":
+            kernels = list_kernels()
+            body = json.dumps(kernels).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(body))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif parsed.path == "/api/data":
+            kernel = qs.get("kernel", ["attention"])[0]
+            data = get_api_data(kernel)
             body = json.dumps(data, default=str).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -470,7 +627,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(body)
-        elif self.path == "/" or self.path == "/index.html":
+
+        elif parsed.path in ("/", "/index.html"):
             body = HTML_PAGE.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -491,7 +649,7 @@ class ReusableHTTPServer(HTTPServer):
 def main():
     server = ReusableHTTPServer(("0.0.0.0", PORT), DashboardHandler)
     print(f"autokernel dashboard running at http://localhost:{PORT}")
-    print(f"Reading results from {RESULTS_FILE}")
+    print(f"Reading results from {RESULTS_DIR}/")
     print("Auto-refreshes every 30 seconds. Ctrl+C to stop.")
     try:
         server.serve_forever()

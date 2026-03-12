@@ -25,9 +25,11 @@ profiles/*.sqlite
 # Autokernel run artifacts (per-run, ephemeral)
 *.log
 logs/
+results/
 results.tsv
 results_summary.md
 reports/
+.autokernel.alive
 
 # IDE
 .vscode/

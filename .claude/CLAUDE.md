@@ -1,5 +1,6 @@
 @01_UNIVERSAL_PRINCIPLES.md
 @03_PROJECT_SPECIFICATION.md
+@04_HARD_WON_LESSONS.md
 
 # blackwell-kernels — Project Principles
 
