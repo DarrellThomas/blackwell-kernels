@@ -214,32 +214,6 @@ flash_attn_v2_kernel(
         __nv_bfloat16 *smem_V_cur = smem_V_base + cur * KV_SMEM_ELEMS;
 
         // ============================================================
-        // Prefetch next K/V tile into alternate buffer (overlaps compute)
-        // ============================================================
-        if (kv_block + 1 < num_kv_blocks) {
-            int nxt = 1 - cur;
-            int kv_start_nxt = (kv_block + 1) * BLOCK_KV;
-            __nv_bfloat16 *smem_K_nxt = smem_K_base + nxt * KV_SMEM_ELEMS;
-            __nv_bfloat16 *smem_V_nxt = smem_V_base + nxt * KV_SMEM_ELEMS;
-            constexpr int CHUNKS_PER_ROW = HEAD_DIM / 8;
-            constexpr int TOTAL_CHUNKS = BLOCK_KV * CHUNKS_PER_ROW;
-            for (int i = tid; i < TOTAL_CHUNKS; i += V2_THREADS) {
-                int row = i / CHUNKS_PER_ROW;
-                int col = (i % CHUNKS_PER_ROW) * 8;
-                int gkv = kv_start_nxt + row;
-                bk::cp_async_128_zfill(
-                    &smem_K_nxt[bk::swizzle_idx<HEAD_DIM>(row, col)],
-                    &K_bh[gkv * HEAD_DIM + col],
-                    gkv < seq_len);
-                bk::cp_async_128_zfill(
-                    &smem_V_nxt[bk::swizzle_idx<HEAD_DIM>(row, col)],
-                    &V_bh[gkv * HEAD_DIM + col],
-                    gkv < seq_len);
-            }
-        }
-        bk::cp_async_commit();
-
-        // ============================================================
         // D.2: Compute S = Q * K^T using MMA
         // ============================================================
         float S_rmem[S_N_CHUNKS][4];
@@ -273,6 +247,32 @@ flash_attn_v2_kernel(
                     S_rmem[nc][2], S_rmem[nc][3]);
             }
         }
+
+        // ============================================================
+        // Prefetch next K/V tile (after QK^T, overlaps softmax + P*V)
+        // ============================================================
+        if (kv_block + 1 < num_kv_blocks) {
+            int nxt = 1 - cur;
+            int kv_start_nxt = (kv_block + 1) * BLOCK_KV;
+            __nv_bfloat16 *smem_K_nxt = smem_K_base + nxt * KV_SMEM_ELEMS;
+            __nv_bfloat16 *smem_V_nxt = smem_V_base + nxt * KV_SMEM_ELEMS;
+            constexpr int CHUNKS_PER_ROW = HEAD_DIM / 8;
+            constexpr int TOTAL_CHUNKS = BLOCK_KV * CHUNKS_PER_ROW;
+            for (int i = tid; i < TOTAL_CHUNKS; i += V2_THREADS) {
+                int row = i / CHUNKS_PER_ROW;
+                int col = (i % CHUNKS_PER_ROW) * 8;
+                int gkv = kv_start_nxt + row;
+                bk::cp_async_128_zfill(
+                    &smem_K_nxt[bk::swizzle_idx<HEAD_DIM>(row, col)],
+                    &K_bh[gkv * HEAD_DIM + col],
+                    gkv < seq_len);
+                bk::cp_async_128_zfill(
+                    &smem_V_nxt[bk::swizzle_idx<HEAD_DIM>(row, col)],
+                    &V_bh[gkv * HEAD_DIM + col],
+                    gkv < seq_len);
+            }
+        }
+        bk::cp_async_commit();
 
         // ============================================================
         // D.3: Apply scale and causal mask
