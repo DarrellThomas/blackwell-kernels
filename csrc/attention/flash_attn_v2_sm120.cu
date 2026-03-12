@@ -71,12 +71,7 @@ flash_attn_v2_kernel(
     constexpr int KV_SMEM_ELEMS = BLOCK_KV * HEAD_DIM;
 
     const int bh_idx = blockIdx.y;
-    // Remap block indices to desynchronize adjacent blocks on the same SM.
-    // Consecutive blockIdx.x values get spread across the Q-tile range so
-    // blocks co-resident on an SM have very different KV iteration counts,
-    // preventing them from entering softmax simultaneously.
-    const int num_q_blocks = gridDim.x;
-    const int q_block = (int)(((unsigned)blockIdx.x * 3u) % (unsigned)num_q_blocks);
+    const int q_block = blockIdx.x;
     const int q_start = q_block * BLOCK_Q;
 
     const int tid = threadIdx.x;
