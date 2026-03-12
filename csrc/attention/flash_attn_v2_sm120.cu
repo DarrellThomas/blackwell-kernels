@@ -461,10 +461,11 @@ void flash_attn_v2_fwd(
             Q, K, V, O, L, seq_len, scale, causal);
     };
 
-    // D=128 uses BLOCK_KV=32 to reduce shared memory and double occupancy
+    // BLOCK_KV=64 gives best MMA:overhead ratio for D=32/64 (32KB smem, 4 blocks/SM)
+    // D=128 uses BLOCK_KV=32 to keep smem at 16KB for higher occupancy
     switch (head_dim) {
         case 32:  launch(flash_attn_v2_kernel<32, 64>,  compute_smem(32, 64));  break;
-        case 64:  launch(flash_attn_v2_kernel<64, 32>,  compute_smem(64, 32));  break;
+        case 64:  launch(flash_attn_v2_kernel<64, 64>,  compute_smem(64, 64));  break;
         case 128: launch(flash_attn_v2_kernel<128, 32>, compute_smem(128, 32)); break;
         default: break;
     }
