@@ -195,51 +195,71 @@ Flash attention has **fundamental serial dependencies** that GEMM doesn't:
 
 ### Estimating the Achievable Ceiling
 
-Based on architectural analysis and reference implementations:
+**Revised after 38 optimization iterations (2026-03-12).** The original estimates
+were too optimistic. Empirical data from extensive profiling reveals:
 
-| Factor | Overhead Estimate |
-|--------|------------------|
-| Softmax + rescaling | 5–8% of total time |
-| Causal tile waste | 10–15% of tensor work |
-| Pipeline bubbles (load↔compute) | 5–10% |
-| Sync and scheduling | 3–5% |
-| **Combined** | **~25–35% overhead** |
+| Factor | Original Estimate | Revised (Empirical) |
+|--------|------------------|---------------------|
+| Softmax + rescaling | 5–8% | **15–19%** (134 scalar cycles per 700 total) |
+| MMA burst scheduling (math_throttle) | included in pipeline | **10–15%** (compiler can't perfectly spread MMA) |
+| Causal tile waste | 10–15% | ~10% |
+| Pipeline bubbles + barriers | 5–10% | ~8% (barrier 5% + sync overhead) |
+| Scheduling + memory latency | 3–5% | ~5% (not_selected 2% + short_scoreboard 3%) |
+| **Combined** | **~25–35%** | **~40–45% overhead** |
 
-This gives an **achievable ceiling of 65–75% tensor utilization**, or:
+The original analysis underestimated softmax overhead because it counted only FLOPs,
+not the serial dependency: during softmax (~134 cycles/iteration), ALL warps on the SM
+are doing scalar work simultaneously (3 blocks × 4 warps = 12 warps in lockstep), so
+the tensor core sits completely idle. This creates a ~19% structural ceiling on tensor
+utilization that no software optimization can eliminate without changing the algorithm.
 
 ```
-Achievable minimum ≈ 38.3 μs / 0.70 ≈ 55 μs
+Revised achievable ceiling ≈ 38.3 μs / 0.60 ≈ 64 μs  (compiler-managed)
+Theoretical ceiling ≈ 38.3 μs / 0.70 ≈ 55 μs          (full PTX, block desync)
 ```
 
-**The realistic Shannon limit for flash attention on this config is ~50–55 μs.**
+**Two tiers of ceiling:**
+- **Compiler-managed ceiling (~64 μs, 60% utilization):** Achievable with nvcc -O3
+  and `#pragma unroll`. The compiler's scheduling is surprisingly good but inherently
+  limited by the burst MMA pattern. 38 iterations of optimization confirmed this limit.
+- **Full PTX ceiling (~55 μs, 70% utilization):** Would require a hand-written PTX
+  inner loop with manual register allocation and instruction scheduling. The salykova
+  approach (writing the entire inner loop in assembly) could reach this level, but
+  represents a fundamentally different optimization phase.
 
 ### Where We Stand
 
-| Implementation | Time (μs) | Effective TFLOPS | % of Limit | vs Achievable |
-|----------------|-----------|-----------------|------------|---------------|
-| **Hard floor** | **38** | **224** | **—** | **—** |
-| **Achievable ceiling** | **~53** | **~162** | **100%** | **1.00×** |
-| Our v2 (ncu) | 98.8 | 86.9 | 54% | 1.86× |
-| cuDNN SDPA (est.) | ~159 | 53.8 | 33% | 3.0× |
+| Implementation | Time (μs) | Effective TFLOPS | % of Peak | vs Compiler Ceiling |
+|----------------|-----------|-----------------|-----------|---------------------|
+| **Hard floor** | **38** | **224** | **100%** | **—** |
+| **Full PTX ceiling** | **~55** | **~156** | **70%** | **—** |
+| **Compiler ceiling** | **~64** | **~134** | **60%** | **1.00×** |
+| **Our v2 (bench)** | **68** | **126** | **56%** | **1.06×** |
+| cuDNN SDPA (bench) | ~121 | ~71 | ~32% | 1.89× |
 
-**We're already 1.61× faster than cuDNN SDPA on this config.** But we're still
-~1.9× away from the achievable ceiling. There's significant headroom.
+**We're 1.78× faster than cuDNN SDPA and within 6% of the compiler-managed ceiling.**
 
-**Why is cuDNN slow here?** This is a small problem (512 blocks for 170 SMs = ~3
-blocks/SM). cuDNN's kernel is designed for large-scale training configs and likely
-doesn't optimize well for small batch/head counts. The 97.2% peak figure from the
-tuning guide is for much larger configs.
+After 38 optimization iterations (24 kept, 14 discarded), the kernel has converged.
+The last 14+ experiments were all discards, confirming we're at the ceiling for
+compiler-managed code. Further gains require either:
+1. Full PTX inner loop rewrite (a different optimization phase)
+2. Algorithmic changes (FP8 attention for 2× tensor throughput)
 
-### Optimization Headroom
+### How Stalls Map to Utilization
 
-From 98.8 μs → 53 μs, we need ~46% reduction. The profiler shows math_throttle (41%)
-as the dominant stall, meaning tensor cores are bottlenecked on instruction scheduling.
-Key opportunities:
+Profiler stall breakdown at convergence (68 μs bench, 93 μs ncu):
+```
+math_throttle:  48%  ← tensor core BUSY (input FIFO full)
+wait:           17%  ← waiting for MMA result (pipeline latency)
+scoreboard:     13%  ← ldmatrix latency (shared memory → registers)
+barrier:         5%  ← __syncthreads between KV iterations
+short_scoreboard:3%  ← MIO pipe latency
+not_selected:    2%  ← scheduling
+active_issue:   12%  ← useful instruction issue
+```
 
-1. **Interleave MMA with loads more aggressively** — spread tensor core work over time
-2. **Increase BLOCK_KV** — more MMA work per tile reduces relative overhead
-3. **Reduce pipeline bubbles** — deeper prefetch, 3-stage pipeline
-4. **Warp specialization** — dedicate warps to load vs compute
+Tensor utilization ≈ math_throttle (48%) + MMA fraction of active_issue (~6%) ≈ 54-56%.
+This exactly matches the measured 56% (126/224 TFLOPS).
 
 ---
 

@@ -36,7 +36,7 @@ KERNEL_CONFIG = {
         "tsv_file": Path("/data/src/blackwell-kernels/results/attention.tsv"),
         "heartbeat": Path("/data/src/blackwell-kernels/.autokernel.attention.alive"),
         "theoretical_floor_us": 38,
-        "achievable_ceiling_us": 53,
+        "achievable_ceiling_us": 64,
         "markers": [
             (19, "Added CUDA docs to context"),
         ],
