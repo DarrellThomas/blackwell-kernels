@@ -52,7 +52,7 @@ __device__ __forceinline__ uint32_t pack_bf16x2(float a, float b)
 // ============================================================
 
 template <int HEAD_DIM, int BLOCK_KV>
-__global__ void __launch_bounds__(V2_THREADS, 3)
+__global__ void __launch_bounds__(V2_THREADS, 4)
 flash_attn_v2_kernel(
     const __nv_bfloat16 *__restrict__ Q,   // [B*H, N, D]
     const __nv_bfloat16 *__restrict__ K,   // [B*H, N, D]
@@ -77,17 +77,18 @@ flash_attn_v2_kernel(
     __nv_bfloat16 *O_bh = O + bh_idx * seq_len * HEAD_DIM;
     float *L_bh = L + bh_idx * seq_len;
 
-    // ---- Shared memory layout (double-buffered K/V, XOR swizzled) ----
-    // P conversion is register-only (shuffles), no shared memory needed.
+    // ---- Shared memory layout (double-buffered K, single V, XOR swizzled) ----
+    // Asymmetric buffering: K is double-buffered (prefetch overlaps softmax+P*V).
+    // V is single-buffered (loaded in prologue, then reloaded after P*V each iteration).
     // Q overlaps K0+K1 during Phase A/B, then freed for KV use.
-    // Layout: [K0: KV] [K1: KV] [V0: KV] [V1: KV]
+    // Layout: [K0: KV] [K1: KV] [V: KV]
     constexpr int KV_SMEM_ELEMS = BLOCK_KV * HEAD_DIM;
 
     extern __shared__ char smem_raw[];
     __nv_bfloat16 *smem_base = reinterpret_cast<__nv_bfloat16 *>(smem_raw);
     __nv_bfloat16 *smem_Q = smem_base;  // Q overlaps K0+(K1) during init
     __nv_bfloat16 *smem_K_base = smem_base;
-    __nv_bfloat16 *smem_V_base = smem_base + 2 * KV_SMEM_ELEMS;
+    __nv_bfloat16 *smem_V = smem_base + 2 * KV_SMEM_ELEMS;  // single buffer
 
     // ================================================================
     // Phase A: Load Q tile global → shared memory via cp.async
@@ -182,11 +183,9 @@ flash_attn_v2_kernel(
     constexpr int P_K_CHUNKS = BLOCK_KV / 16;   // 4
 
     // ================================================================
-    // Prologue: Load first K/V tile into double-buffer slot 0
+    // Prologue: Load first K tile into K[0] and first V tile into V
     // ================================================================
     {
-        __nv_bfloat16 *smem_K0 = smem_K_base;
-        __nv_bfloat16 *smem_V0 = smem_V_base;
         constexpr int CHUNKS_PER_ROW = HEAD_DIM / 8;
         constexpr int TOTAL_CHUNKS = BLOCK_KV * CHUNKS_PER_ROW;
         for (int i = tid; i < TOTAL_CHUNKS; i += V2_THREADS) {
@@ -194,11 +193,11 @@ flash_attn_v2_kernel(
             int col = (i % CHUNKS_PER_ROW) * 8;
             int gkv = row;
             bk::cp_async_128_zfill(
-                &smem_K0[bk::swizzle_idx<HEAD_DIM>(row, col)],
+                &smem_K_base[bk::swizzle_idx<HEAD_DIM>(row, col)],
                 &K_bh[gkv * HEAD_DIM + col],
                 gkv < seq_len);
             bk::cp_async_128_zfill(
-                &smem_V0[bk::swizzle_idx<HEAD_DIM>(row, col)],
+                &smem_V[bk::swizzle_idx<HEAD_DIM>(row, col)],
                 &V_bh[gkv * HEAD_DIM + col],
                 gkv < seq_len);
         }
@@ -211,7 +210,7 @@ flash_attn_v2_kernel(
         int kv_start = kv_block * BLOCK_KV;
         int cur = kv_block & 1;
         __nv_bfloat16 *smem_K_cur = smem_K_base + cur * KV_SMEM_ELEMS;
-        __nv_bfloat16 *smem_V_cur = smem_V_base + cur * KV_SMEM_ELEMS;
+        // V uses single buffer (asymmetric: already loaded in prologue or prev epilogue)
 
         // ============================================================
         // D.2: Compute S = Q * K^T using MMA
@@ -259,13 +258,13 @@ flash_attn_v2_kernel(
         }
 
         // ============================================================
-        // Prefetch next K/V tile (after QK^T, overlaps softmax + P*V)
+        // Prefetch next K tile (after QK^T, overlaps softmax + P*V)
+        // V prefetch deferred until after P*V (single-buffer constraint)
         // ============================================================
         if (kv_block + 1 < num_kv_blocks) {
             int nxt = 1 - cur;
             int kv_start_nxt = (kv_block + 1) * BLOCK_KV;
             __nv_bfloat16 *smem_K_nxt = smem_K_base + nxt * KV_SMEM_ELEMS;
-            __nv_bfloat16 *smem_V_nxt = smem_V_base + nxt * KV_SMEM_ELEMS;
             constexpr int CHUNKS_PER_ROW = HEAD_DIM / 8;
             constexpr int TOTAL_CHUNKS = BLOCK_KV * CHUNKS_PER_ROW;
             for (int i = tid; i < TOTAL_CHUNKS; i += V2_THREADS) {
@@ -275,10 +274,6 @@ flash_attn_v2_kernel(
                 bk::cp_async_128_zfill(
                     &smem_K_nxt[bk::swizzle_idx<HEAD_DIM>(row, col)],
                     &K_bh[gkv * HEAD_DIM + col],
-                    gkv < seq_len);
-                bk::cp_async_128_zfill(
-                    &smem_V_nxt[bk::swizzle_idx<HEAD_DIM>(row, col)],
-                    &V_bh[gkv * HEAD_DIM + col],
                     gkv < seq_len);
             }
         }
@@ -389,7 +384,7 @@ flash_attn_v2_kernel(
                     int t_in_sub = lane_id % 8;
                     int v_row = kc * 16 + (sub % 2) * 8 + t_in_sub;
                     int v_col = (nc + sub / 2) * 8;
-                    const void *addr_v = &smem_V_cur[bk::swizzle_idx<HEAD_DIM>(v_row, v_col)];
+                    const void *addr_v = &smem_V[bk::swizzle_idx<HEAD_DIM>(v_row, v_col)];
 
                     uint32_t V_r0, V_r1, V_r2, V_r3;
                     bk::ldmatrix_x4_trans(V_r0, V_r1, V_r2, V_r3, addr_v);
@@ -413,7 +408,24 @@ flash_attn_v2_kernel(
             }
         }
 
-        // Sync: prefetch data visible for next iteration
+        // Prefetch next V tile (after P*V consumed current V, safe to overwrite)
+        if (kv_block + 1 < num_kv_blocks) {
+            int kv_start_nxt = (kv_block + 1) * BLOCK_KV;
+            constexpr int CHUNKS_PER_ROW = HEAD_DIM / 8;
+            constexpr int TOTAL_CHUNKS = BLOCK_KV * CHUNKS_PER_ROW;
+            for (int i = tid; i < TOTAL_CHUNKS; i += V2_THREADS) {
+                int row = i / CHUNKS_PER_ROW;
+                int col = (i % CHUNKS_PER_ROW) * 8;
+                int gkv = kv_start_nxt + row;
+                bk::cp_async_128_zfill(
+                    &smem_V[bk::swizzle_idx<HEAD_DIM>(row, col)],
+                    &V_bh[gkv * HEAD_DIM + col],
+                    gkv < seq_len);
+            }
+        }
+        bk::cp_async_commit();
+
+        // Sync: K and V prefetches visible for next iteration
         bk::cp_async_wait<0>();
         __syncthreads();
     } // end KV loop
@@ -481,10 +493,10 @@ void flash_attn_v2_fwd(
     dim3 grid(num_q_blocks, bh);
     dim3 block(V2_THREADS);
 
-    // Shared memory: [K0] [K1] [V0] [V1] — Q overlaps K during init
+    // Shared memory: [K0] [K1] [V] — asymmetric buffering, Q overlaps K during init
     auto compute_smem = [](int hd, int bkv) {
         int kv_elems = bkv * hd;
-        return 4 * kv_elems * (int)sizeof(__nv_bfloat16);
+        return 3 * kv_elems * (int)sizeof(__nv_bfloat16);
     };
 
     auto launch = [&](auto kernel_fn, int smem_bytes) {
