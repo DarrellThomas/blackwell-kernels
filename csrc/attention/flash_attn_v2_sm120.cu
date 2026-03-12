@@ -52,7 +52,7 @@ __device__ __forceinline__ uint32_t pack_bf16x2(float a, float b)
 // ============================================================
 
 template <int HEAD_DIM, int BLOCK_KV>
-__global__ void __launch_bounds__(V2_THREADS)
+__global__ void __launch_bounds__(V2_THREADS, 3)
 flash_attn_v2_kernel(
     const __nv_bfloat16 *__restrict__ Q,   // [B*H, N, D]
     const __nv_bfloat16 *__restrict__ K,   // [B*H, N, D]
