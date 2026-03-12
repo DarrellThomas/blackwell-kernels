@@ -55,7 +55,12 @@ LOOP FOREVER:
    - If `primary_vs_sdpa` is worse or equal → `git reset --hard HEAD~1` (discard).
    - If tests fail but the idea is sound → attempt fix (max 3 tries), else discard.
 9. **RECORD**: Log results to `results.tsv` (see format below).
-10. **LOOP**: Go to step 1. The new profile will reveal a new #1 bottleneck.
+10. **UPDATE STATE**: Update `docs/gemm_agent_state.md` with:
+    - Current best (commit, duration, vs cuBLAS ratio, top stall)
+    - Updated diagnosis if the bottleneck profile changed
+    - Any new direction insights from this iteration
+    This file is the persistent memory across context clears — the watchdog flushes context after every cycle. If you don't write it back here, the next cycle wakes up with stale state.
+11. **LOOP**: Go to step 1. The new profile will reveal a new #1 bottleneck.
 
 ## What You CAN Modify
 

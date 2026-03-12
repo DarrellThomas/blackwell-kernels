@@ -2,6 +2,8 @@
 @03_PROJECT_SPECIFICATION.md
 @04_HARD_WON_LESSONS.md
 @../docs/math_throttle_optimization.md
+@../docs/reference_spatters_mma_matmul.md
+@../docs/gemm_agent_state.md
 
 # blackwell-kernels — Project Principles
 

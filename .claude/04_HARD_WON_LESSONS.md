@@ -67,6 +67,34 @@ GPU 0 has ComfyUI running. Always use `CUDA_VISIBLE_DEVICES=1`. Forgetting this 
 
 ---
 
+## cp.async Visibility Gotcha
+
+**cp.async writes ARE visible to shared memory reads before `cp.async.wait<0>`.** This is technically undefined behavior per the PTX spec, but it manifests as silent data corruption — not a crash. Experiment 39 proved this: swapping compute-before-load to load-before-compute (reading smem while cp.async writes to the same buffer) produced 70% relative errors on all sizes except the trivial case (M=2048,K=64 where there are no next tiles to load). Same-buffer load-compute overlap is **impossible** with cp.async double-buffering. You CANNOT issue cp.async to a buffer while any warp reads from it.
+
+---
+
+## 2-Tile Unroll Race Condition
+
+**The 2-tile K-loop unroll has an implicit warp-synchrony requirement.** The loop computes buf[0] then buf[1], then prefetches into buf[0] and buf[1]. There is NO barrier between the compute and prefetch phases. This works with 8 warps (256 threads) because all warps complete compute_tile at nearly the same cycle (identical workloads, 2 warps per scheduler). With 16 warps (512 threads, 4 per scheduler), warp scheduling stagger causes fast warps to start cp.async into buf[0] while slow warps still read buf[0] via ldmatrix. This produces ~20% data corruption errors.
+
+Adding `__syncthreads()` between compute and prefetch fixes correctness but doubles barrier count, negating the entire benefit of the 2-tile unroll. The current 8-warp / 2-tile-unroll configuration is the only one that works without the extra barrier. Do not increase warps beyond 8 without either adding the barrier or switching to a different loop structure.
+
+---
+
+## GEMM Tile Configuration
+
+**BLOCK_M=128, BLOCK_N=128, BLOCK_K=32 with 8 warps is the optimal configuration.** Confirmed through 40 experiments. All alternatives regressed:
+- BLOCK_K=64: too much data per load, wait stalls dominate (rows 4, 7, 35)
+- BLOCK_N=64: fewer smem reads but worse compute-to-load ratio (rows 15, 32)
+- BLOCK_M=256 or BLOCK_N=256: excess smem kills L1 cache (rows 15, 20, 37)
+- 2D warp tiling (any arrangement): more A ldmatrix loads = more bank conflicts (rows 11, 28, 34)
+- 3-stage pipeline: occupancy loss offsets latency benefit (row 6, 30)
+- launch_bounds(256,2): barrier stalls double (rows 14, 29)
+
+**The 32KB shared memory sweet spot.** The GEMM kernel uses 32KB double-buffered smem, leaving 96KB for L1 cache. Any configuration exceeding 32KB (3 stages, 4 buffers, larger tiles) reduces L1 cache and degrades performance — the L1 penalty always exceeds the smem benefit.
+
+---
+
 ## Reference Implementations
 
 **gau-nernst** wrote custom flash attention for RTX 5090 and achieved 94.4% of 209.5 TFLOPS peak using BLOCK_Q=128. This is our feasibility proof — we know sm_120 can get there.

@@ -32,7 +32,7 @@ __device__ __forceinline__ void mma_m16n8k16_bf16(
     uint32_t b0, uint32_t b1,
     float c0, float c1, float c2, float c3)
 {
-    asm volatile(
+    asm(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
         "{%0, %1, %2, %3}, "
         "{%4, %5, %6, %7}, "
