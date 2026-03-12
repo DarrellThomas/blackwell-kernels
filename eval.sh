@@ -59,6 +59,16 @@ export PYTHONPATH=python
 
 NCU="$CUDA_HOME/bin/ncu"
 
+# ─── HEARTBEAT ────────────────────────────────────────────────────────────────
+# Signal dashboard that this kernel's loop is alive.
+# File content = loop start epoch (written once); mtime = last heartbeat.
+HEARTBEAT_FILE=".autokernel.${KERNEL}.alive"
+if [[ -f "$HEARTBEAT_FILE" ]]; then
+    touch "$HEARTBEAT_FILE"
+else
+    date +%s > "$HEARTBEAT_FILE"
+fi
+
 echo "=== KERNEL: $KERNEL ==="
 
 # Key ncu metrics for bottleneck identification
