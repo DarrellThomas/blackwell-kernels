@@ -133,8 +133,21 @@ flash_attn_v2_kernel(
                             Q_rmem[dc][2], Q_rmem[dc][3], addr);
         }
     }
+    // Pre-scale Q by attention scale factor — eliminates per-block scale multiply
+    {
+        __nv_bfloat162 scale_vec = __float2bfloat162_rn(scale);
+        #pragma unroll
+        for (int dc = 0; dc < D_CHUNKS; dc++) {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                __nv_bfloat162 q_val = *reinterpret_cast<__nv_bfloat162*>(&Q_rmem[dc][i]);
+                q_val = __hmul2(q_val, scale_vec);
+                Q_rmem[dc][i] = *reinterpret_cast<uint32_t*>(&q_val);
+            }
+        }
+    }
     __syncthreads();
-    // Q now in registers. K0+K1 space is free for KV double-buffering.
+    // Q now in registers (pre-scaled). K0+K1 space is free for KV double-buffering.
 
     // ================================================================
     // Phase C: Initialize O accumulators and softmax state
@@ -264,13 +277,9 @@ flash_attn_v2_kernel(
         // ============================================================
         // D.3: Apply scale and causal mask
         // ============================================================
+        // Scale already applied to Q registers (Phase B)
         #pragma unroll
         for (int nc = 0; nc < S_N_CHUNKS; nc++) {
-            S_rmem[nc][0] *= scale;
-            S_rmem[nc][1] *= scale;
-            S_rmem[nc][2] *= scale;
-            S_rmem[nc][3] *= scale;
-
             int col0 = kv_start + nc * 8 + (lane_id % 4) * 2;
             int col1 = col0 + 1;
 
