@@ -150,40 +150,26 @@ bf16_gemm_kernel(
     };
 
     // ============================================================
-    // Prologue: load first K-tile into buffer 0
+    // Prologue: load first 2 K-tiles
     // ============================================================
-    load_A_tile(0, smem_A);
-    load_B_tile(0, smem_B);
-    if (A_aligned || B_aligned) {
-        bk::cp_async_commit();
+    {
+        int prefetch_count = (num_k_blocks < 2) ? num_k_blocks : 2;
+        for (int s = 0; s < prefetch_count; s++) {
+            load_A_tile(s * GEMM_BLOCK_K, smem_A + s * A_SMEM_ELEMS);
+            load_B_tile(s * GEMM_BLOCK_K, smem_B + s * B_SMEM_ELEMS);
+            bk::cp_async_commit();
+        }
         bk::cp_async_wait<0>();
     }
     __syncthreads();
 
     // ============================================================
-    // Main K-loop
+    // Main K-loop: process 2 K-tiles per sync (halves barrier count)
     // ============================================================
-    for (int kb = 0; kb < num_k_blocks; kb++) {
-        int cur = kb & 1;
-        __nv_bfloat16 *A_cur = smem_A + cur * A_SMEM_ELEMS;
-        __nv_bfloat16 *B_cur = smem_B + cur * B_SMEM_ELEMS;
-
-        // ---- Prefetch next K-tile into alternate buffer ----
-        if (kb + 1 < num_k_blocks) {
-            int nxt = 1 - cur;
-            int k_start_nxt = (kb + 1) * GEMM_BLOCK_K;
-            load_A_tile(k_start_nxt, smem_A + nxt * A_SMEM_ELEMS);
-            load_B_tile(k_start_nxt, smem_B + nxt * B_SMEM_ELEMS);
-        }
-        if (A_aligned || B_aligned)
-            bk::cp_async_commit();
-
-        // ---- Compute: iterate over K-chunks within the tile ----
+    // Helper lambda: compute one K-tile from shared memory buffers
+    auto compute_tile = [&](const __nv_bfloat16 *A_buf, const __nv_bfloat16 *B_buf) {
         #pragma unroll
         for (int kc = 0; kc < GEMM_MMA_K_TILES; kc++) {
-
-            // Load A fragments via ldmatrix_x4
-            // Each warp loads its own WARP_M rows (2 m16 tiles)
             #pragma unroll
             for (int mt = 0; mt < GEMM_MMA_M_TILES; mt++) {
                 int warp_m_off = warp_id * GEMM_WARP_M + mt * 16;
@@ -191,25 +177,20 @@ bf16_gemm_kernel(
                 int t_in_sub = lane_id % 8;
                 int smem_row = warp_m_off + (sub / 2) * 8 + t_in_sub;
                 int smem_col = kc * 16 + (sub % 2) * 8;
-                const void *addr_a = &A_cur[bk::swizzle_idx<GEMM_BLOCK_K>(smem_row, smem_col)];
+                const void *addr_a = &A_buf[bk::swizzle_idx<GEMM_BLOCK_K>(smem_row, smem_col)];
 
                 uint32_t A_r0, A_r1, A_r2, A_r3;
                 bk::ldmatrix_x4(A_r0, A_r1, A_r2, A_r3, addr_a);
 
-                // Compute all N-tiles with this A fragment
                 #pragma unroll
                 for (int nt = 0; nt < GEMM_MMA_N_TILES; nt++) {
-                    // Load B fragment via ldmatrix_x2_trans
-                    // B is [K, N] row-major in shared memory.
-                    // ldmatrix_x2_trans gives col-major fragment: computes A*B (not A*B^T)
                     int b_row = kc * 16 + (lane_id % 8) + ((lane_id / 8) % 2) * 8;
                     int b_col = nt * 8;
-                    const void *addr_b = &B_cur[bk::swizzle_idx<GEMM_BLOCK_N>(b_row, b_col)];
+                    const void *addr_b = &B_buf[bk::swizzle_idx<GEMM_BLOCK_N>(b_row, b_col)];
 
                     uint32_t B_r0, B_r1;
                     bk::ldmatrix_x2_trans(B_r0, B_r1, addr_b);
 
-                    // a1/a2 swap: hard-won lesson from attention kernel
                     bk::mma_m16n8k16_bf16(
                         C_rmem[mt][nt][0], C_rmem[mt][nt][1],
                         C_rmem[mt][nt][2], C_rmem[mt][nt][3],
@@ -220,10 +201,29 @@ bf16_gemm_kernel(
                 }
             }
         }
+    };
 
-        // Wait for prefetch to complete before next iteration
-        if (A_aligned || B_aligned)
-            bk::cp_async_wait<0>();
+    for (int kb = 0; kb < num_k_blocks; kb += 2) {
+        // Compute tile kb from buf[0]
+        compute_tile(smem_A, smem_B);
+
+        // Compute tile kb+1 from buf[1] (if it exists)
+        if (kb + 1 < num_k_blocks) {
+            compute_tile(smem_A + A_SMEM_ELEMS, smem_B + B_SMEM_ELEMS);
+        }
+
+        // Prefetch next 2 tiles
+        if (kb + 2 < num_k_blocks) {
+            load_A_tile((kb + 2) * GEMM_BLOCK_K, smem_A);
+            load_B_tile((kb + 2) * GEMM_BLOCK_K, smem_B);
+            bk::cp_async_commit();
+        }
+        if (kb + 3 < num_k_blocks) {
+            load_A_tile((kb + 3) * GEMM_BLOCK_K, smem_A + A_SMEM_ELEMS);
+            load_B_tile((kb + 3) * GEMM_BLOCK_K, smem_B + B_SMEM_ELEMS);
+            bk::cp_async_commit();
+        }
+        bk::cp_async_wait<0>();
         __syncthreads();
     } // end K-loop
 
