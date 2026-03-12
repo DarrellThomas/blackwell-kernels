@@ -396,26 +396,33 @@ flash_attn_v2_kernel(
                     P_a[t][3] = pack_bf16x2(S_rmem[t][nc1][2], S_rmem[t][nc1][3]);
                 }
 
-                #pragma unroll
-                for (int nc = 0; nc < O_N_CHUNKS; nc += 2) {
-                    // ldmatrix.x4.trans: load 2 consecutive V B-fragments
+                // Preload ALL V fragments for this kc before any MMA
+                // This separates loads from compute, allowing the compiler
+                // to hoist V loads into the softmax gap
+                uint32_t V_all[O_N_CHUNKS / 2][4];
+                {
                     int sub = lane_id / 8;
                     int t_in_sub = lane_id % 8;
-                    int v_row = kc * 16 + (sub % 2) * 8 + t_in_sub;
-                    int v_col = (nc + sub / 2) * 8;
-                    const void *addr_v = &smem_V_cur[bk::swizzle_idx<HEAD_DIM>(v_row, v_col)];
+                    #pragma unroll
+                    for (int nc = 0; nc < O_N_CHUNKS; nc += 2) {
+                        int v_row = kc * 16 + (sub % 2) * 8 + t_in_sub;
+                        int v_col = (nc + sub / 2) * 8;
+                        const void *addr_v = &smem_V_cur[bk::swizzle_idx<HEAD_DIM>(v_row, v_col)];
+                        bk::ldmatrix_x4_trans(V_all[nc/2][0], V_all[nc/2][1],
+                                              V_all[nc/2][2], V_all[nc/2][3], addr_v);
+                    }
+                }
 
-                    uint32_t V_r0, V_r1, V_r2, V_r3;
-                    bk::ldmatrix_x4_trans(V_r0, V_r1, V_r2, V_r3, addr_v);
-
-                    // MMA for each Q tile (V loaded once, reused across tiles)
+                // MMA with preloaded V
+                #pragma unroll
+                for (int nc = 0; nc < O_N_CHUNKS; nc += 2) {
                     #pragma unroll
                     for (int t = 0; t < WARP_Q_TILES; t++) {
                         bk::mma_m16n8k16_bf16(
                             O_rmem[t][nc][0], O_rmem[t][nc][1],
                             O_rmem[t][nc][2], O_rmem[t][nc][3],
                             P_a[t][0], P_a[t][1], P_a[t][2], P_a[t][3],
-                            V_r0, V_r1,
+                            V_all[nc/2][0], V_all[nc/2][1],
                             O_rmem[t][nc][0], O_rmem[t][nc][1],
                             O_rmem[t][nc][2], O_rmem[t][nc][3]);
 
@@ -423,7 +430,7 @@ flash_attn_v2_kernel(
                             O_rmem[t][nc+1][0], O_rmem[t][nc+1][1],
                             O_rmem[t][nc+1][2], O_rmem[t][nc+1][3],
                             P_a[t][0], P_a[t][1], P_a[t][2], P_a[t][3],
-                            V_r2, V_r3,
+                            V_all[nc/2][2], V_all[nc/2][3],
                             O_rmem[t][nc+1][0], O_rmem[t][nc+1][1],
                             O_rmem[t][nc+1][2], O_rmem[t][nc+1][3]);
                     }
