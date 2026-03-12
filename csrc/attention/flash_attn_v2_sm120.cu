@@ -312,8 +312,8 @@ flash_attn_v2_kernel(
                             fmaxf(row_max[1], this_max[1])};
 
         float rescale[2];
-        rescale[0] = (row_max[0] == -FLT_MAX) ? 0.0f : __expf(row_max[0] - new_max[0]);
-        rescale[1] = (row_max[1] == -FLT_MAX) ? 0.0f : __expf(row_max[1] - new_max[1]);
+        rescale[0] = __expf(row_max[0] - new_max[0]);
+        rescale[1] = __expf(row_max[1] - new_max[1]);
 
         #pragma unroll
         for (int n = 0; n < O_N_CHUNKS; n++) {
@@ -325,10 +325,10 @@ flash_attn_v2_kernel(
 
         #pragma unroll
         for (int nc = 0; nc < S_N_CHUNKS; nc++) {
-            S_rmem[nc][0] = (S_rmem[nc][0] == -FLT_MAX) ? 0.0f : __expf(S_rmem[nc][0] - new_max[0]);
-            S_rmem[nc][1] = (S_rmem[nc][1] == -FLT_MAX) ? 0.0f : __expf(S_rmem[nc][1] - new_max[0]);
-            S_rmem[nc][2] = (S_rmem[nc][2] == -FLT_MAX) ? 0.0f : __expf(S_rmem[nc][2] - new_max[1]);
-            S_rmem[nc][3] = (S_rmem[nc][3] == -FLT_MAX) ? 0.0f : __expf(S_rmem[nc][3] - new_max[1]);
+            S_rmem[nc][0] = __expf(S_rmem[nc][0] - new_max[0]);
+            S_rmem[nc][1] = __expf(S_rmem[nc][1] - new_max[0]);
+            S_rmem[nc][2] = __expf(S_rmem[nc][2] - new_max[1]);
+            S_rmem[nc][3] = __expf(S_rmem[nc][3] - new_max[1]);
         }
 
         float local_sum[2] = {0.0f, 0.0f};
