@@ -95,6 +95,12 @@ Adding `__syncthreads()` between compute and prefetch fixes correctness but doub
 
 ---
 
+## Volatile Requirements
+
+**ldmatrix MUST remain `asm volatile`.** Non-volatile ldmatrix allows the compiler to reorder shared memory loads across `__syncthreads` and `cp_async_wait` barriers, causing massive data corruption (>100% relative error on most test cases). This is different from MMA where removing volatile is safe — ldmatrix reads from shared memory that changes after barriers, so the compiler must not hoist or delay these loads.
+
+---
+
 ## Reference Implementations
 
 **gau-nernst** wrote custom flash attention for RTX 5090 and achieved 94.4% of 209.5 TFLOPS peak using BLOCK_Q=128. This is our feasibility proof — we know sm_120 can get there.
