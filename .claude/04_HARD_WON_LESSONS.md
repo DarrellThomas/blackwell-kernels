@@ -100,6 +100,33 @@ GPU 0 has ComfyUI running. Always use `CUDA_VISIBLE_DEVICES=1`. Forgetting this 
 
 **To actually beat the compiler, you need a radical approach.** A single large `asm` block with full manual register allocation and instruction scheduling — not incremental PTX additions to a compiler-managed kernel. The salykova approach (writing the entire inner loop in PTX with explicit register naming) is the right idea, but requires committing fully to assembly for the hot path. For the attention kernel specifically, the target is overlapping the ~328 non-MMA softmax instructions between QK^T and PV with MMA/load operations from adjacent phases — something the compiler cannot do because it respects the sequential phase boundaries.
 
+### v3 PTX Experiments (2026-03-13, experiments 54-60)
+
+Six approaches tested, all correct pieces individually validated, but no speedup captured:
+
+| Approach | Operands | Result | Why |
+|----------|----------|--------|-----|
+| C++ fused exp2f+PV loop | N/A | 0.070 ms (neutral) | Compiler already crosses phase boundaries with `#pragma unroll` |
+| Deferred sum shuffle | N/A | 0.070 ms (neutral) | `__shfl_xor_sync` doesn't block non-volatile MMA pipeline |
+| Per-kc PTX (CVT+LDSM+MMA) | 44 | 0.070 ms (correct, neutral) | ptxas reorders back to compiler-preferred schedule |
+| 2-kc paired PTX blocks | 60 | 0.070 ms (correct, neutral) | Same — ptxas chooses same schedule as v2 within each block |
+| Monolithic PTX block | 84 | **0.047 ms** but **WRONG** | 66 "+f" outputs caused register misassignment; "speedup" was computing garbage |
+| PTX exp2f only + C++ rest | 6 | 0.070 ms (correct, neutral) | Validates PTX `sub.f32`+`ex2.approx.f32` matches C++ `exp2f()` |
+
+**Key PTX ISA findings for sm_120:**
+
+1. **`cvt.rn.bf16x2.f32 d, a, b` has REVERSED operand order vs C++.** PTX puts first source (a) in HIGH bits [31:16] and second source (b) in LOW bits [15:0]. C++ `__floats2bfloat162_rn(a, b)` puts a in LOW and b in HIGH. To match C++: `cvt.rn.bf16x2.f32 d, b, a` (swap). Verified empirically — without swap, MMA gets garbage P fragments and produces constant output.
+
+2. **`shfl.sync.bfly.b32` c parameter = 31 (0x1f), NOT 0x1f1f.** For `.bfly` mode on sm_120, c[4:0] = warp_width - 1 = 31 for full warp. The packed format (c = (width-1)<<8 | clamp) does NOT work — produces identity shuffles. Only c[4:0] matters for `.bfly`. Verified: c=31 correct, c=0x1f1f broken, c=0x1f00 broken.
+
+3. **`ex2.approx.f32` in PTX matches `exp2f()` in C++ under `--use_fast_math`.** Both map to MUFU.EX2 in SASS. Safe to use interchangeably.
+
+4. **Monolithic asm blocks with >50 "+f" output operands produce wrong results on nvcc/CUDA 13.** The exact threshold is between 34 (works) and 66 (broken). Likely a ptxas register allocator limitation — too many simultaneously-live in/out operands cause silent misassignment. The kernel compiles, runs, and even appears faster (because it's doing less useful work), but produces garbage.
+
+5. **ptxas respects instruction order within `asm volatile` blocks but optimizes aggressively.** For blocks under ~50 operands, ptxas produces the same schedule regardless of the programmer's instruction ordering. The compiler+ptxas combo is already near-optimal for this kernel. The only way to truly control scheduling is the salykova approach: ALL registers PTX-managed (`.reg`), no C++ operand interface, addresses computed inside PTX from a single smem base pointer.
+
+**Conclusion:** Incremental PTX (replacing individual phases with inline asm while keeping the C++ operand interface) cannot beat the compiler for this attention kernel. The next step requires either (a) full salykova-style PTX with zero C++ interface, or (b) FP8 attention which changes the arithmetic intensity ratio fundamentally.
+
 ---
 
 ## Current Performance (2026-03-13)

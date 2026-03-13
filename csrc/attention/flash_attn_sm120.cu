@@ -285,6 +285,11 @@ torch::Tensor flash_attn_v2_forward(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     float scale, bool causal);
 
+// Declared in flash_attn_v3_sm120.cu
+torch::Tensor flash_attn_v3_forward(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V,
+    float scale, bool causal);
+
 // Declared in bf16_gemm_sm120.cu
 torch::Tensor bf16_gemm(torch::Tensor A, torch::Tensor B);
 
@@ -296,6 +301,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("scale"), py::arg("causal") = false);
     m.def("flash_attn_v2_forward", &flash_attn_v2_forward,
           "Flash Attention forward v2 (sm_120, MMA tensor cores)",
+          py::arg("Q"), py::arg("K"), py::arg("V"),
+          py::arg("scale"), py::arg("causal") = false);
+    m.def("flash_attn_v3_forward", &flash_attn_v3_forward,
+          "Flash Attention forward v3 (sm_120, fused exp2f+PV)",
           py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("scale"), py::arg("causal") = false);
     m.def("bf16_gemm", &bf16_gemm,

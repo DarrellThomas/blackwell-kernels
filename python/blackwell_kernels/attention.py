@@ -57,3 +57,19 @@ def flash_attn_v2_sm120(
         scale = Q.shape[-1] ** -0.5
 
     return flash_attn_v2_forward(Q, K, V, scale, causal)
+
+
+def flash_attn_v3_sm120(
+    Q: torch.Tensor,  # [B, H, N, D] BF16
+    K: torch.Tensor,  # [B, H, N, D] BF16
+    V: torch.Tensor,  # [B, H, N, D] BF16
+    causal: bool = False,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Flash attention v3 forward pass — fused exp2f+PV scheduling on sm_120."""
+    from blackwell_kernels._C import flash_attn_v3_forward
+
+    if scale is None:
+        scale = Q.shape[-1] ** -0.5
+
+    return flash_attn_v3_forward(Q, K, V, scale, causal)

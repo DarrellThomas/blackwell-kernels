@@ -105,11 +105,11 @@ SASS analysis confirms the compiler already:
 
 ## Next Directions (requires architectural changes)
 
-**Check `04_HARD_WON_LESSONS.md` before attempting anything** — 53 experiments worth of dead ends are documented there with root causes. C++ occupancy-first optimization has been tried and ruled out (experiments 50-53).
+**Check `04_HARD_WON_LESSONS.md` before attempting anything** — 60 experiments worth of dead ends are documented there with root causes. C++ optimization AND incremental PTX have been tried and ruled out (experiments 50-60).
 
-1. **Full inner-loop PTX** — hand-scheduled assembly to overlap softmax scalar ops with MMA/load from adjacent phases. Target: ~55 μs. This is the **only remaining C-level opportunity**: the ~328 non-MMA instructions between QK^T and PV could be overlapped with MMA from adjacent phases using manual scheduling. The compiler respects phase boundaries; hand-written PTX can cross them. See `docs/reference_ptx_scheduling_guide.md` and `docs/reference_ptx_gemm_inner_loops.md` for technique reference. The `tests/test_ptx_mma.cu` proof-of-concept shows PTX register declarations inside asm blocks work on sm_120.
+1. **Full salykova-style PTX** — entire inner loop in a single asm block with ALL registers PTX-managed (`.reg`), zero C++ operand interface, smem addresses computed inside PTX. This is the only way to beat the compiler's scheduling. Incremental PTX (replacing phases while keeping C++ operand interface) was proven ineffective — ptxas produces the same schedule regardless of instruction order for blocks under ~50 operands. Target: ~55 μs. See `04_HARD_WON_LESSONS.md` "v3 PTX Experiments" for the full analysis. Key PTX ISA findings documented there (CVT bf16x2 operand reversal, SHFL c=31, operand limit ~50).
 
-2. **FP8 attention** — `mma.sync.aligned.m16n8k32` gives 2x tensor throughput, making softmax overhead proportionally smaller. The softmax gap stays fixed while MMA throughput doubles.
+2. **FP8 attention** — `mma.sync.aligned.m16n8k32` gives 2x tensor throughput, making softmax overhead proportionally half as large. The softmax gap stays fixed while MMA throughput doubles. **This is the highest-ROI next step.**
 
 3. **Algorithmic changes** — sigmoid attention or other softmax alternatives that eliminate the sequential dependency between QK^T and PV.
 
