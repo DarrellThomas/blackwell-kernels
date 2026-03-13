@@ -1,6 +1,6 @@
 # Attention Kernel — Optimization State
 
-**Last updated:** 2026-03-12 (experiment 37)
+**Last updated:** 2026-03-12 (experiment 49)
 **Goal:** Maximize speedup vs cuDNN SDPA on RTX 5090 (sm_120)
 
 -----
@@ -15,8 +15,8 @@
 ```
 Q: loaded once to registers via ldmatrix_x4, reused across all KV blocks
 K: loaded via ldmatrix_x4 (was scalar, upgraded iteration 20)
-V: loaded via ldmatrix_x2_trans (computes A*B directly, no transpose)
-P: FP32 accumulators → register-only BF16 conversion via warp shuffles (no smem round-trip)
+V: pre-loaded via ldmatrix_x4_trans before PV MMA (compiler hoists into softmax gap)
+P: FP32 accumulators → register-only BF16 conversion via pack_bf16x2 (no smem round-trip)
 ```
 
 **Key structural decisions (load-bearing, do not remove):**
@@ -29,17 +29,18 @@ P: FP32 accumulators → register-only BF16 conversion via warp shuffles (no sme
 - Skip mask optimization for fully unmasked KV blocks
 - Dynamic BLOCK_Q dispatch (128 for large grids, 64 otherwise)
 - Prefetch next K/V after QK^T (barrier reduced 6%→3%)
+- Separate V preload from PV MMA (compiler hoists V loads into softmax gap)
 
 -----
 
 ## Current Best
 
-| Commit  | Duration (us) | vs SDPA | SM%  | Top Stall      |
-|---------|---------------|---------|------|----------------|
-| 2cb22e7 | 93.8          | **1.76x** | 59.8 | math throttle |
-| dynamic | 93.5          | **1.76x** | 59.7 | math throttle |
+| Commit  | Duration (bench) | Duration (ncu) | vs SDPA | SM%  | Top Stall      |
+|---------|------------------|----------------|---------|------|----------------|
+| 8976daf | **68 μs**        | 93.7 μs        | **1.78x** | 59.1 | math throttle |
 
 Primary config: B=2 H=8 N=2048 D=64, causal. 10 warmup + 100 timed iterations.
+Register usage: 145 regs, 0 spills, 3 blocks/SM, 12 warps.
 
 Dynamic BQ dispatch also gives: N=4096 → 2x faster (1.15x SDPA), D=128 → 7x faster (1.00x SDPA).
 
@@ -49,13 +50,23 @@ Dynamic BQ dispatch also gives: N=4096 → 2x faster (1.15x SDPA), D=128 → 7x 
 
 The kernel is **compute-bound** (math_pipe_throttle ~48% is dominant stall). The tensor cores saturate in bursts during QK^T and PV MMA phases, then starve during softmax.
 
-**1.76x SDPA is near the ceiling for the current architecture.** 37 experiments explored scheduling, tiling, buffering, softmax, and dispatch strategies. The remaining gap to theoretical limits is dominated by irreducible softmax overhead between the two MMA phases.
+**C++ optimization space is exhausted.** 49 experiments (8 kept, 41 discarded) explored every axis: scheduling, tiling (BQ=32/64/128, BKV=32/64/96/128), buffering (double/triple/asymmetric), softmax variants, prefetch timing, V preloading, P pre-packing, loop reorders, launch_bounds, compiler hints, causal templating, and output coalescing. The compiler produces near-identical SASS for most C++ restructurings.
+
+SASS analysis confirms the compiler already:
+- Interleaves QK^T HMMA with K LDSM loads
+- Hoists 3 of 8 V LDSM loads into the softmax gap (after V preload refactor)
+- Interleaves the last ~8 exp2f (MUFU.EX2) with the first ~4 PV HMMA
+
+**68 μs bench = 94% of compiler ceiling (64 μs).** The remaining 6% gap is from suboptimal compiler instruction ordering that cannot be controlled from C++.
+
+**Stall breakdown:** math_throttle 48%, wait 17%, scoreboard 12%, barrier 5%, not_selected 2%
 
 **Ceilings:**
-- Compiler ceiling: ~64 us (best achievable with `#pragma unroll` + good scheduling)
-- Current: 93.5 us = 68% of compiler ceiling
-- Full PTX ceiling: ~55 us (hand-written assembly with perfect MMA/load interleaving)
-- Hard floor: ~38 us (tensor math only, unreachable — softmax is irreducible)
+- Compiler ceiling: ~64 μs (best achievable with `#pragma unroll` + good scheduling)
+- Current: 68 μs bench = 94% of compiler ceiling
+- Full PTX ceiling: ~55 μs (hand-written assembly with perfect MMA/load interleaving)
+- Hard floor: ~38 μs (tensor math only, unreachable — softmax is irreducible)
+- Achievable ceiling: ~53 μs (~70% tensor utilization, accounting for fundamental overheads)
 
 -----
 
@@ -67,15 +78,33 @@ The kernel is **compute-bound** (math_pipe_throttle ~48% is dominant stall). The
 4. Skip mask for unmasked KV blocks — 60+ fewer conditionals
 5. ldmatrix_x4 for K loads — fewer instructions per MMA pair
 6. Dynamic BLOCK_Q dispatch — BQ=128 when grid large enough
+7. Separate V preload from PV MMA — compiler hoists V loads into softmax gap
 
 -----
 
-## Next Directions to Explore
+## What Didn't Work (selected, full list in results/attention.tsv)
 
-**Check `04_HARD_WON_LESSONS.md` before attempting anything** — 37 experiments worth of dead ends are documented there with root causes.
+- Any tile size other than BQ=64 BKV=64 for primary config (register pressure or grid too small)
+- Loop reorders (nc-outer/dc-inner, fused exp2f into PV) — compiler produces identical SASS
+- 3-stage pipeline — smem dropped occupancy 3→2 blocks/SM
+- Deferred sum shuffles — bench regression, shuffles may aid scheduling
+- Pre-pack all P before PV — 16 extra regs increased barrier stalls
+- Pre-load V before softmax — 16 extra live regs hurt register pressure
+- Asymmetric K/V buffering — extra __syncthreads overhead
+- Block index remapping — destroyed L2 locality
+- `-O2` flag — identical code
+- Template on CAUSAL — compiler handles runtime branch well
 
-1. **Full inner-loop PTX** — hand-scheduled assembly to overlap softmax scalar ops with MMA/load from adjacent phases. Target: ~55 us.
-2. **FP8 attention** — `mma.sync.aligned.m16n8k32` gives 2x tensor throughput, making softmax overhead proportionally smaller.
+-----
+
+## Next Directions (requires architectural changes)
+
+**Check `04_HARD_WON_LESSONS.md` before attempting anything** — 49 experiments worth of dead ends are documented there with root causes.
+
+1. **Full inner-loop PTX** — hand-scheduled assembly to overlap softmax scalar ops with MMA/load from adjacent phases. Target: ~55 μs. This is the primary remaining opportunity: the ~328 non-MMA instructions between QK^T and PV could be overlapped with MMA from adjacent phases using manual scheduling.
+
+2. **FP8 attention** — `mma.sync.aligned.m16n8k32` gives 2x tensor throughput, making softmax overhead proportionally smaller. The softmax gap stays fixed while MMA throughput doubles.
+
 3. **Algorithmic changes** — sigmoid attention or other softmax alternatives that eliminate the sequential dependency between QK^T and PV.
 
 -----

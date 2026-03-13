@@ -44,6 +44,28 @@ __device__ __forceinline__ void mma_m16n8k16_bf16(
           "f"(c0), "f"(c1), "f"(c2), "f"(c3));
 }
 
+// Non-volatile MMA: allows compiler to reorder MMA instructions relative to
+// each other and non-volatile ops, enabling better interleaving with loads.
+// Use in compute-bound kernels (GEMM) where MMA/load overlap matters.
+// ldmatrix and cp_async MUST remain volatile.
+__device__ __forceinline__ void mma_m16n8k16_bf16_nv(
+    float &d0, float &d1, float &d2, float &d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1,
+    float c0, float c1, float c2, float c3)
+{
+    asm(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+          "r"(b0), "r"(b1),
+          "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+}
+
 // ============================================================
 // FP8 MMA: m16n8k32 (2x throughput vs BF16)
 // Input A: 4x uint32_t (16 FP8 values)
