@@ -1,6 +1,6 @@
 # Attention Kernel — Optimization State
 
-**Last updated:** 2026-03-12 (experiment 49)
+**Last updated:** 2026-03-13 (experiment 53)
 **Goal:** Maximize speedup vs cuDNN SDPA on RTX 5090 (sm_120)
 
 -----
@@ -13,7 +13,7 @@
 
 **Data path:**
 ```
-Q: loaded once to registers via ldmatrix_x4, reused across all KV blocks
+Q: loaded once to registers via ldmatrix_x4_mma (baked swap), reused across all KV blocks
 K: loaded via ldmatrix_x4 (was scalar, upgraded iteration 20)
 V: pre-loaded via ldmatrix_x4_trans before PV MMA (compiler hoists into softmax gap)
 P: FP32 accumulators → register-only BF16 conversion via pack_bf16x2 (no smem round-trip)
@@ -23,7 +23,8 @@ P: FP32 accumulators → register-only BF16 conversion via pack_bf16x2 (no smem 
 - cp.async with double-buffer pipelining for K/V
 - XOR swizzle for bank conflict elimination
 - Register-only P→A conversion (eliminated dominant bank conflicts)
-- a1/a2 register swap (r0, r2, r1, r3) — empirically required on sm_120
+- a1/a2 register swap via ldmatrix_x4_mma (baked into load, no MOVs needed)
+- Non-volatile MMA (`mma_m16n8k16_bf16_nv`) for compiler scheduling freedom
 - Online softmax with 4-thread group shuffles (XOR masks 1, 2)
 - exp2f softmax with LOG2E folded into Q scale
 - Skip mask optimization for fully unmasked KV blocks
@@ -38,9 +39,11 @@ P: FP32 accumulators → register-only BF16 conversion via pack_bf16x2 (no smem 
 | Commit  | Duration (bench) | Duration (ncu) | vs SDPA | SM%  | Top Stall      |
 |---------|------------------|----------------|---------|------|----------------|
 | 8976daf | **68 μs**        | 93.7 μs        | **1.78x** | 59.1 | math throttle |
+| current | **69 μs**        | —               | **1.76x** | —    | math throttle |
 
 Primary config: B=2 H=8 N=2048 D=64, causal. 10 warmup + 100 timed iterations.
 Register usage: 145 regs, 0 spills, 3 blocks/SM, 12 warps.
+Code cleanup (exp 50): non-volatile MMA + ldmatrix_x4_mma — performance-neutral, cleaner code.
 
 Dynamic BQ dispatch also gives: N=4096 → 2x faster (1.15x SDPA), D=128 → 7x faster (1.00x SDPA).
 
@@ -50,7 +53,7 @@ Dynamic BQ dispatch also gives: N=4096 → 2x faster (1.15x SDPA), D=128 → 7x 
 
 The kernel is **compute-bound** (math_pipe_throttle ~48% is dominant stall). The tensor cores saturate in bursts during QK^T and PV MMA phases, then starve during softmax.
 
-**C++ optimization space is exhausted.** 49 experiments (8 kept, 41 discarded) explored every axis: scheduling, tiling (BQ=32/64/128, BKV=32/64/96/128), buffering (double/triple/asymmetric), softmax variants, prefetch timing, V preloading, P pre-packing, loop reorders, launch_bounds, compiler hints, causal templating, and output coalescing. The compiler produces near-identical SASS for most C++ restructurings.
+**C++ optimization space is exhausted.** 53 experiments (9 kept, 44 discarded) explored every axis: scheduling, tiling (BQ=32/64/128, BKV=32/64/96/128), buffering (double/triple/asymmetric), softmax variants, prefetch timing, V preloading, P pre-packing, loop reorders, launch_bounds, occupancy-first tiling (borrowed from GEMM), compiler hints, causal templating, and output coalescing. The compiler produces near-identical SASS for most C++ restructurings.
 
 SASS analysis confirms the compiler already:
 - Interleaves QK^T HMMA with K LDSM loads
@@ -79,11 +82,14 @@ SASS analysis confirms the compiler already:
 5. ldmatrix_x4 for K loads — fewer instructions per MMA pair
 6. Dynamic BLOCK_Q dispatch — BQ=128 when grid large enough
 7. Separate V preload from PV MMA — compiler hoists V loads into softmax gap
+8. Non-volatile MMA + ldmatrix_x4_mma — code cleanup, eliminates MOVs (perf-neutral)
 
 -----
 
 ## What Didn't Work (selected, full list in results/attention.tsv)
 
+- **Occupancy-first tiling (GEMM strategy)** — BKV=32 with launch_bounds 5-6 (77 μs, -13%). Halving BKV doubles softmax passes; occupancy gain can't compensate for sequential overhead. GEMM trick doesn't transfer because GEMM inner loop is pure MMA, attention has irreducible softmax.
+- **launch_bounds(128, 4) with BKV=64** — 4×32KB = 128KB hits SM limit; 72 μs (-5%). Reg cap 128 (was 145) didn't help enough.
 - Any tile size other than BQ=64 BKV=64 for primary config (register pressure or grid too small)
 - Loop reorders (nc-outer/dc-inner, fused exp2f into PV) — compiler produces identical SASS
 - 3-stage pipeline — smem dropped occupancy 3→2 blocks/SM
@@ -99,9 +105,9 @@ SASS analysis confirms the compiler already:
 
 ## Next Directions (requires architectural changes)
 
-**Check `04_HARD_WON_LESSONS.md` before attempting anything** — 49 experiments worth of dead ends are documented there with root causes.
+**Check `04_HARD_WON_LESSONS.md` before attempting anything** — 53 experiments worth of dead ends are documented there with root causes. C++ occupancy-first optimization has been tried and ruled out (experiments 50-53).
 
-1. **Full inner-loop PTX** — hand-scheduled assembly to overlap softmax scalar ops with MMA/load from adjacent phases. Target: ~55 μs. This is the primary remaining opportunity: the ~328 non-MMA instructions between QK^T and PV could be overlapped with MMA from adjacent phases using manual scheduling.
+1. **Full inner-loop PTX** — hand-scheduled assembly to overlap softmax scalar ops with MMA/load from adjacent phases. Target: ~55 μs. This is the **only remaining C-level opportunity**: the ~328 non-MMA instructions between QK^T and PV could be overlapped with MMA from adjacent phases using manual scheduling. The compiler respects phase boundaries; hand-written PTX can cross them. See `docs/reference_ptx_scheduling_guide.md` and `docs/reference_ptx_gemm_inner_loops.md` for technique reference. The `tests/test_ptx_mma.cu` proof-of-concept shows PTX register declarations inside asm blocks work on sm_120.
 
 2. **FP8 attention** — `mma.sync.aligned.m16n8k32` gives 2x tensor throughput, making softmax overhead proportionally smaller. The softmax gap stays fixed while MMA throughput doubles.
 

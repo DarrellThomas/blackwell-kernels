@@ -12,7 +12,8 @@ Build custom CUDA kernels targeting sm_120's `mma.sync` tensor core instructions
 | Metric | Target | Current |
 |--------|--------|---------|
 | v2 MMA correctness | All tests pass | DONE |
-| v2 vs cuDNN SDPA | >50% SDPA speed | 14-69% (unoptimized) |
+| v2 vs cuDNN SDPA | >100% SDPA speed | **1.76x SDPA** (D=64 N=2048 causal) |
+| BF16 GEMM vs cuBLAS | ≥1.0x cuBLAS | **0.98x cuBLAS** (4096³), 1.23x (non-square) |
 | FP8 attention | Working kernel | Not started |
 | Integration with autoresearch | Drop-in replacement | Not started |
 
@@ -154,15 +155,14 @@ O, L = flash_attn_v2_sm120(Q, K, V, causal=True)
 
 ## 6. Performance Baselines
 
-### v2 MMA vs cuDNN SDPA (causal, RTX 5090)
+### v2 MMA vs cuDNN SDPA (causal, RTX 5090) — 2026-03-13
 | B | H | N | D | SDPA (ms) | v1 (ms) | v2 (ms) | v2/SDPA |
 |---|---|---|---|-----------|---------|---------|---------|
-| 2 | 8 | 512 | 64 | 0.017 | 0.107 | 0.041 | 0.40x |
-| 2 | 8 | 1024 | 64 | 0.034 | 0.298 | 0.081 | 0.41x |
-| 2 | 8 | 2048 | 64 | 0.121 | 0.637 | 0.175 | 0.69x |
-| 2 | 8 | 4096 | 64 | 0.302 | 2.127 | 0.517 | 0.58x |
-| 4 | 16 | 2048 | 64 | 0.229 | 1.751 | 0.425 | 0.54x |
-| 4 | 16 | 2048 | 128 | 0.425 | 3.853 | 2.971 | 0.14x |
+| 2 | 8 | 512 | 64 | 0.017 | 0.107 | 0.012 | **1.35x** |
+| 2 | 8 | 1024 | 64 | 0.034 | 0.299 | 0.033 | **1.02x** |
+| 2 | 8 | 2048 | 64 | 0.121 | 0.639 | 0.069 | **1.76x** |
+| 2 | 8 | 4096 | 64 | 0.303 | 2.178 | 0.262 | **1.15x** |
+| 4 | 16 | 2048 | 64 | 0.237 | 1.778 | 0.225 | **1.05x** |
+| 4 | 16 | 2048 | 128 | 0.426 | 3.877 | 0.428 | **1.00x** |
 
-v2 is 3-9x faster than v1. Gap to cuDNN is expected for an unoptimized first MMA pass.
-Optimization path: pipelining, swizzle, register P conversion, cp.async.
+v2 now beats cuDNN SDPA on all D=64 configs. Optimizations: cp.async pipelining, XOR swizzle, register-only P→A conversion, non-volatile MMA, ldmatrix_x4_mma, dynamic BQ dispatch.

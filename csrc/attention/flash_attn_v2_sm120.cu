@@ -130,8 +130,8 @@ flash_attn_v2_kernel(
                 int smem_row = tile_off + (sub / 2) * 8 + t_in_sub;
                 int smem_col = dc * 16 + (sub % 2) * 8;
                 const void *addr = &smem_Q[bk::swizzle_idx<HEAD_DIM>(smem_row, smem_col)];
-                bk::ldmatrix_x4(Q_rmem[t][dc][0], Q_rmem[t][dc][1],
-                                Q_rmem[t][dc][2], Q_rmem[t][dc][3], addr);
+                bk::ldmatrix_x4_mma(Q_rmem[t][dc][0], Q_rmem[t][dc][1],
+                                    Q_rmem[t][dc][2], Q_rmem[t][dc][3], addr);
             }
         }
     }
@@ -247,20 +247,20 @@ flash_attn_v2_kernel(
                 // MMA for each Q tile (K loaded once, reused across tiles)
                 #pragma unroll
                 for (int t = 0; t < WARP_Q_TILES; t++) {
-                    bk::mma_m16n8k16_bf16(
+                    bk::mma_m16n8k16_bf16_nv(
                         S_rmem[t][nc][0], S_rmem[t][nc][1],
                         S_rmem[t][nc][2], S_rmem[t][nc][3],
-                        Q_rmem[t][dc][0], Q_rmem[t][dc][2],
-                        Q_rmem[t][dc][1], Q_rmem[t][dc][3],
+                        Q_rmem[t][dc][0], Q_rmem[t][dc][1],
+                        Q_rmem[t][dc][2], Q_rmem[t][dc][3],
                         K_r0, K_r1,
                         S_rmem[t][nc][0], S_rmem[t][nc][1],
                         S_rmem[t][nc][2], S_rmem[t][nc][3]);
 
-                    bk::mma_m16n8k16_bf16(
+                    bk::mma_m16n8k16_bf16_nv(
                         S_rmem[t][nc+1][0], S_rmem[t][nc+1][1],
                         S_rmem[t][nc+1][2], S_rmem[t][nc+1][3],
-                        Q_rmem[t][dc][0], Q_rmem[t][dc][2],
-                        Q_rmem[t][dc][1], Q_rmem[t][dc][3],
+                        Q_rmem[t][dc][0], Q_rmem[t][dc][1],
+                        Q_rmem[t][dc][2], Q_rmem[t][dc][3],
                         K_r2, K_r3,
                         S_rmem[t][nc+1][0], S_rmem[t][nc+1][1],
                         S_rmem[t][nc+1][2], S_rmem[t][nc+1][3]);
@@ -418,7 +418,7 @@ flash_attn_v2_kernel(
                 for (int nc = 0; nc < O_N_CHUNKS; nc += 2) {
                     #pragma unroll
                     for (int t = 0; t < WARP_Q_TILES; t++) {
-                        bk::mma_m16n8k16_bf16(
+                        bk::mma_m16n8k16_bf16_nv(
                             O_rmem[t][nc][0], O_rmem[t][nc][1],
                             O_rmem[t][nc][2], O_rmem[t][nc][3],
                             P_a[t][0], P_a[t][1], P_a[t][2], P_a[t][3],
@@ -426,7 +426,7 @@ flash_attn_v2_kernel(
                             O_rmem[t][nc][0], O_rmem[t][nc][1],
                             O_rmem[t][nc][2], O_rmem[t][nc][3]);
 
-                        bk::mma_m16n8k16_bf16(
+                        bk::mma_m16n8k16_bf16_nv(
                             O_rmem[t][nc+1][0], O_rmem[t][nc+1][1],
                             O_rmem[t][nc+1][2], O_rmem[t][nc+1][3],
                             P_a[t][0], P_a[t][1], P_a[t][2], P_a[t][3],

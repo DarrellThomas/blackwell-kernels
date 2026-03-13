@@ -36,7 +36,8 @@ CUDA_VISIBLE_DEVICES=1 /usr/local/cuda-13/bin/nvcc -O2 -gencode arch=compute_120
 ### ldmatrix_x4 → MMA a1/a2 SWAP
 ldmatrix_x4 outputs: r0=m0k0, r1=m0k1, r2=m1k0, r3=m1k1
 MMA expects:         a0=m0k0, a1=m1k0, a2=m0k1, a3=m1k1
-**Pass (r0, r2, r1, r3) to MMA — always swap r1 and r2.**
+**Preferred: use `ldmatrix_x4_mma()` which bakes swap into operand order `{%0, %2, %1, %3}`.**
+Legacy: pass `(r0, r2, r1, r3)` to MMA if using plain `ldmatrix_x4`.
 
 ### ldmatrix_x4 addressing (ALT mapping)
 ```
