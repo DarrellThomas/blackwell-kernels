@@ -19,6 +19,7 @@ setup(
                 os.path.join(ROOT, "csrc/attention/flash_attn_sm120.cu"),
                 os.path.join(ROOT, "csrc/attention/flash_attn_v2_sm120.cu"),
                 os.path.join(ROOT, "csrc/attention/flash_attn_v3_sm120.cu"),
+                os.path.join(ROOT, "csrc/attention/flash_attn_fp8_sm120.cu"),
                 os.path.join(ROOT, "csrc/gemm/bf16_gemm_sm120.cu"),
             ],
             extra_compile_args={

@@ -73,3 +73,23 @@ def flash_attn_v3_sm120(
         scale = Q.shape[-1] ** -0.5
 
     return flash_attn_v3_forward(Q, K, V, scale, causal)
+
+
+def flash_attn_fp8_sm120(
+    Q: torch.Tensor,  # [B, H, N, D] BF16
+    K: torch.Tensor,  # [B, H, N, D] BF16
+    V: torch.Tensor,  # [B, H, N, D] BF16
+    causal: bool = False,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Flash attention FP8 forward pass — e4m3 m16n8k32 on sm_120.
+
+    Inputs are BF16 (converted to FP8 inside kernel). Softmax in FP32.
+    2x tensor core throughput vs BF16 at reduced precision.
+    """
+    from blackwell_kernels._C import flash_attn_fp8_forward
+
+    if scale is None:
+        scale = Q.shape[-1] ** -0.5
+
+    return flash_attn_fp8_forward(Q, K, V, scale, causal)
