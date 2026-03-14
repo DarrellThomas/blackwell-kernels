@@ -73,4 +73,20 @@ __device__ __forceinline__ void ldmatrix_x2_trans(uint32_t &r0, uint32_t &r1, co
         : "r"(addr));
 }
 
+// Load 4 matrices with a1/a2 swap baked into operand order.
+// ldmatrix outputs: r0=m0k0, r1=m0k1, r2=m1k0, r3=m1k1
+// MMA expects:      a0=m0k0, a1=m1k0, a2=m0k1, a3=m1k1
+// By using {%0, %2, %1, %3} the outputs land directly in MMA order,
+// eliminating the need for separate MOV instructions.
+__device__ __forceinline__ void ldmatrix_x4_mma(
+    uint32_t &r0, uint32_t &r1, uint32_t &r2, uint32_t &r3,
+    const void *smem_ptr)
+{
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %2, %1, %3}, [%4];\n"
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+        : "r"(addr));
+}
+
 } // namespace bk

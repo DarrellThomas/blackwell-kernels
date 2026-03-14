@@ -14,9 +14,14 @@
 // A is row-major, B is row-major. MMA does A(row) * B(col), so we load B transposed
 // via ldmatrix_x2_trans to get col-major fragments directly.
 //
-// Tile config: BLOCK_M=128, BLOCK_N=128, BLOCK_K=32, 8 warps (256 threads)
-// Each warp computes a 16x128 sub-tile of C (1 m16 tile in M, all N tiles).
+// Tile config: BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, 4 warps (128 threads)
+// Warp layout: 2 in M × 2 in N. Each warp computes 32×32 of output
+// (2 m16 tiles × 4 n8 tiles). 6 blocks/SM = 24 warps for high occupancy.
 // Double-buffered K tiles for pipelining.
+//
+// Key optimization: Python wrapper pads inputs to exact tile multiples,
+// so the kernel has ZERO boundary checks — all loads are 16-byte aligned,
+// all stores are valid. No branches in the hot loop.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -33,43 +38,99 @@
 // Tile and thread configuration
 // ============================================================
 
-constexpr int GEMM_BLOCK_M = 128;
-constexpr int GEMM_BLOCK_N = 128;
+constexpr int GEMM_BLOCK_M = 64;
+constexpr int GEMM_BLOCK_N = 64;
 constexpr int GEMM_BLOCK_K = 32;
-constexpr int GEMM_NUM_WARPS = 8;
+constexpr int GEMM_NUM_WARPS = 4;
 constexpr int GEMM_WARP_SIZE = 32;
-constexpr int GEMM_THREADS = GEMM_NUM_WARPS * GEMM_WARP_SIZE;  // 256
+constexpr int GEMM_THREADS = GEMM_NUM_WARPS * GEMM_WARP_SIZE;  // 128
 
-// Each warp handles WARP_M rows x full BLOCK_N columns
-constexpr int GEMM_WARP_M = GEMM_BLOCK_M / GEMM_NUM_WARPS;    // 16
+// Warp layout: 2 warps in M × 2 warps in N = 4 warps
+// Each warp computes 32×32 of output (2 m16 tiles × 4 n8 tiles)
+// Target: 6 blocks/SM (24 warps, 6/subpartition) — smaller blocks, more of them
+constexpr int GEMM_WARPS_M = 2;
+constexpr int GEMM_WARPS_N = 2;
+constexpr int GEMM_WARP_M = GEMM_BLOCK_M / GEMM_WARPS_M;      // 32
+constexpr int GEMM_WARP_N = GEMM_BLOCK_N / GEMM_WARPS_N;      // 32
 
 // MMA tile: m16n8k16
-// Per warp: 1 m16 tile in M dimension, BLOCK_N/8 n8 tiles in N dimension
-constexpr int GEMM_MMA_M_TILES = GEMM_WARP_M / 16;             // 1
-constexpr int GEMM_MMA_N_TILES = GEMM_BLOCK_N / 8;             // 16
+// Per warp: 2 m16 tiles × 4 n8 tiles = 8 MMA per K-chunk
+constexpr int GEMM_MMA_M_TILES = GEMM_WARP_M / 16;             // 2
+constexpr int GEMM_MMA_N_TILES = GEMM_WARP_N / 8;              // 4
 constexpr int GEMM_MMA_K_TILES = GEMM_BLOCK_K / 16;            // 2
 
 // ============================================================
-// GEMM kernel
+// Compute: preload A per kc, stream B across N-tiles.
+// Non-volatile MMA gives compiler full scheduling freedom.
 // ============================================================
 
-__global__ void __launch_bounds__(GEMM_THREADS, 1)
+template <int M_TILES, int N_TILES, int K_TILES, int BLOCK_K_PARAM, int BLOCK_N_PARAM>
+__device__ __forceinline__ void compute_full_tile(
+    float accum[][N_TILES][4],          // [M_TILES][N_TILES][4] accumulators
+    const __nv_bfloat16 *A_smem,        // A shared memory (XOR swizzled)
+    const __nv_bfloat16 *B_smem,        // B shared memory (XOR swizzled)
+    int warp_m_off,                     // M offset for this warp
+    int warp_n_off,                     // N offset for this warp
+    int sub, int t_in_sub, int lane_id) // thread addressing
+{
+    int b_row_base = (lane_id % 8) + ((lane_id / 8) % 2) * 8;
+
+    #pragma unroll
+    for (int kc = 0; kc < K_TILES; kc++) {
+        // Preload A fragments for both M-tiles in this K-chunk
+        uint32_t a[M_TILES][4];
+        #pragma unroll
+        for (int mt = 0; mt < M_TILES; mt++) {
+            int smem_row = warp_m_off + mt * 16 + (sub / 2) * 8 + t_in_sub;
+            int smem_col = kc * 16 + (sub % 2) * 8;
+            const void *addr = &A_smem[bk::swizzle_idx<BLOCK_K_PARAM>(smem_row, smem_col)];
+            bk::ldmatrix_x4_mma(a[mt][0], a[mt][1], a[mt][2], a[mt][3], addr);
+        }
+
+        // Stream B across N-tiles, execute MMA for both M-tiles
+        int b_row = b_row_base + kc * 16;
+        #pragma unroll
+        for (int nt = 0; nt < N_TILES; nt++) {
+            int b_col = warp_n_off + nt * 8;
+            const void *addr_b = &B_smem[bk::swizzle_idx<BLOCK_N_PARAM>(b_row, b_col)];
+            uint32_t b0, b1;
+            bk::ldmatrix_x2_trans(b0, b1, addr_b);
+
+            #pragma unroll
+            for (int mt = 0; mt < M_TILES; mt++) {
+                bk::mma_m16n8k16_bf16_nv(
+                    accum[mt][nt][0], accum[mt][nt][1],
+                    accum[mt][nt][2], accum[mt][nt][3],
+                    a[mt][0], a[mt][1], a[mt][2], a[mt][3],
+                    b0, b1,
+                    accum[mt][nt][0], accum[mt][nt][1],
+                    accum[mt][nt][2], accum[mt][nt][3]);
+            }
+        }
+    }
+}
+
+// ============================================================
+// GEMM kernel — ZERO boundary checks version
+// Requires: M % BLOCK_M == 0, N % BLOCK_N == 0, K % BLOCK_K == 0
+// The Python wrapper pads inputs to guarantee this.
+// ============================================================
+
+__global__ void __launch_bounds__(GEMM_THREADS, 6)
 bf16_gemm_kernel(
-    const __nv_bfloat16 *__restrict__ A,   // [M, K] row-major
-    const __nv_bfloat16 *__restrict__ B,   // [K, N] row-major
-    __nv_bfloat16 *__restrict__ C,         // [M, N] row-major
+    const __nv_bfloat16 *__restrict__ A,   // [M_padded, K_padded] row-major
+    const __nv_bfloat16 *__restrict__ B,   // [K_padded, N_padded] row-major
+    __nv_bfloat16 *__restrict__ C,         // [M_padded, N_padded] row-major
     int M, int N, int K)
 {
-    const int bm = blockIdx.y * GEMM_BLOCK_M;  // M-tile start
-    const int bn = blockIdx.x * GEMM_BLOCK_N;  // N-tile start
+    const int bm = blockIdx.y * GEMM_BLOCK_M;
+    const int bn = blockIdx.x * GEMM_BLOCK_N;
 
     const int tid = threadIdx.x;
     const int warp_id = tid / GEMM_WARP_SIZE;
     const int lane_id = tid % GEMM_WARP_SIZE;
 
     // ---- Shared memory layout (double-buffered A and B) ----
-    // A: [BLOCK_M, BLOCK_K] x 2 buffers, swizzled
-    // B: [BLOCK_K, BLOCK_N] x 2 buffers, swizzled
     constexpr int A_SMEM_ELEMS = GEMM_BLOCK_M * GEMM_BLOCK_K;
     constexpr int B_SMEM_ELEMS = GEMM_BLOCK_K * GEMM_BLOCK_N;
 
@@ -78,8 +139,7 @@ bf16_gemm_kernel(
     __nv_bfloat16 *smem_B = smem_A + 2 * A_SMEM_ELEMS;
 
     // ============================================================
-    // Initialize FP32 accumulators: each warp has WARP_M/16 * BLOCK_N/8 MMA tiles
-    // Each MMA tile produces 4 floats per thread
+    // Initialize FP32 accumulators — [M_TILES][N_TILES][4]
     // ============================================================
     float C_rmem[GEMM_MMA_M_TILES][GEMM_MMA_N_TILES][4];
     #pragma unroll
@@ -93,173 +153,103 @@ bf16_gemm_kernel(
         }
     }
 
-    int num_k_blocks = (K + GEMM_BLOCK_K - 1) / GEMM_BLOCK_K;
-
-    // cp.async requires 16-byte aligned source and full 8-element chunks in bounds.
-    // For partial boundary chunks, fall back to element-wise loads with zero padding.
-    const bool A_aligned = (K % 8 == 0);
-    const bool B_aligned = (N % 8 == 0);
-    const __nv_bfloat16 ZERO_BF16 = __float2bfloat16_rn(0.0f);
+    int num_k_blocks = K / GEMM_BLOCK_K;  // exact division guaranteed
 
     // ============================================================
-    // Helper: load A tile [BLOCK_M, BLOCK_K] from global to shared
+    // Load helpers — NO boundary checks, ALL cp.async
     // ============================================================
     auto load_A_tile = [&](int k_start, __nv_bfloat16 *dst) {
         constexpr int A_CHUNKS_PER_ROW = GEMM_BLOCK_K / 8;
         constexpr int A_TOTAL_CHUNKS = GEMM_BLOCK_M * A_CHUNKS_PER_ROW;
+        #pragma unroll
         for (int i = tid; i < A_TOTAL_CHUNKS; i += GEMM_THREADS) {
             int row = i / A_CHUNKS_PER_ROW;
             int col = (i % A_CHUNKS_PER_ROW) * 8;
             int gm = bm + row;
             int gk = k_start + col;
             int dst_idx = bk::swizzle_idx<GEMM_BLOCK_K>(row, col);
-            bool full_chunk = gm < M && (gk + 7) < K;
-            if (A_aligned && full_chunk) {
-                bk::cp_async_128(&dst[dst_idx], &A[gm * K + gk]);
-            } else {
-                #pragma unroll
-                for (int j = 0; j < 8; j++)
-                    dst[dst_idx + j] = (gm < M && (gk + j) < K)
-                        ? A[gm * K + gk + j] : ZERO_BF16;
-            }
+            bk::cp_async_128(&dst[dst_idx], &A[gm * K + gk]);
         }
     };
 
-    // ============================================================
-    // Helper: load B tile [BLOCK_K, BLOCK_N] from global to shared
-    // ============================================================
     auto load_B_tile = [&](int k_start, __nv_bfloat16 *dst) {
         constexpr int B_CHUNKS_PER_ROW = GEMM_BLOCK_N / 8;
         constexpr int B_TOTAL_CHUNKS = GEMM_BLOCK_K * B_CHUNKS_PER_ROW;
+        #pragma unroll
         for (int i = tid; i < B_TOTAL_CHUNKS; i += GEMM_THREADS) {
             int row = i / B_CHUNKS_PER_ROW;
             int col = (i % B_CHUNKS_PER_ROW) * 8;
             int gk = k_start + row;
             int gn = bn + col;
             int dst_idx = bk::swizzle_idx<GEMM_BLOCK_N>(row, col);
-            bool full_chunk = gk < K && (gn + 7) < N;
-            if (B_aligned && full_chunk) {
-                bk::cp_async_128(&dst[dst_idx], &B[gk * N + gn]);
-            } else {
-                #pragma unroll
-                for (int j = 0; j < 8; j++)
-                    dst[dst_idx + j] = (gk < K && (gn + j) < N)
-                        ? B[gk * N + gn + j] : ZERO_BF16;
-            }
+            bk::cp_async_128(&dst[dst_idx], &B[gk * N + gn]);
         }
     };
 
     // ============================================================
-    // Prologue: load first 2 K-tiles
+    // Prologue: load first K-tile
     // ============================================================
-    {
-        int prefetch_count = (num_k_blocks < 2) ? num_k_blocks : 2;
-        for (int s = 0; s < prefetch_count; s++) {
-            load_A_tile(s * GEMM_BLOCK_K, smem_A + s * A_SMEM_ELEMS);
-            load_B_tile(s * GEMM_BLOCK_K, smem_B + s * B_SMEM_ELEMS);
-            bk::cp_async_commit();
-        }
-        bk::cp_async_wait<0>();
-    }
+    load_A_tile(0, smem_A);
+    load_B_tile(0, smem_B);
+    bk::cp_async_commit();
+    bk::cp_async_wait<0>();
     __syncthreads();
 
     // ============================================================
-    // Main K-loop: process 2 K-tiles per sync (halves barrier count)
+    // Main K-loop — tight, no branches except the loop itself
     // ============================================================
-    // Helper lambda: compute one K-tile from shared memory buffers
-    auto compute_tile = [&](const __nv_bfloat16 *A_buf, const __nv_bfloat16 *B_buf) {
-        #pragma unroll
-        for (int kc = 0; kc < GEMM_MMA_K_TILES; kc++) {
-            #pragma unroll
-            for (int mt = 0; mt < GEMM_MMA_M_TILES; mt++) {
-                int warp_m_off = warp_id * GEMM_WARP_M + mt * 16;
-                int sub = lane_id / 8;
-                int t_in_sub = lane_id % 8;
-                int smem_row = warp_m_off + (sub / 2) * 8 + t_in_sub;
-                int smem_col = kc * 16 + (sub % 2) * 8;
-                const void *addr_a = &A_buf[bk::swizzle_idx<GEMM_BLOCK_K>(smem_row, smem_col)];
+    int sub = lane_id / 8;
+    int t_in_sub = lane_id % 8;
+    int warp_m_id = warp_id / GEMM_WARPS_N;   // 0..1
+    int warp_n_id = warp_id % GEMM_WARPS_N;   // 0..1
+    int warp_m_off = warp_m_id * GEMM_WARP_M; // 0, 32
+    int warp_n_off = warp_n_id * GEMM_WARP_N; // 0, 32
 
-                uint32_t A_r0, A_r1, A_r2, A_r3;
-                bk::ldmatrix_x4(A_r0, A_r1, A_r2, A_r3, addr_a);
+    for (int kb = 0; kb < num_k_blocks; kb++) {
+        int cur = kb & 1;
+        __nv_bfloat16 *A_cur = smem_A + cur * A_SMEM_ELEMS;
+        __nv_bfloat16 *B_cur = smem_B + cur * B_SMEM_ELEMS;
 
-                #pragma unroll
-                for (int nt = 0; nt < GEMM_MMA_N_TILES; nt++) {
-                    int b_row = kc * 16 + (lane_id % 8) + ((lane_id / 8) % 2) * 8;
-                    int b_col = nt * 8;
-                    const void *addr_b = &B_buf[bk::swizzle_idx<GEMM_BLOCK_N>(b_row, b_col)];
-
-                    uint32_t B_r0, B_r1;
-                    bk::ldmatrix_x2_trans(B_r0, B_r1, addr_b);
-
-                    bk::mma_m16n8k16_bf16(
-                        C_rmem[mt][nt][0], C_rmem[mt][nt][1],
-                        C_rmem[mt][nt][2], C_rmem[mt][nt][3],
-                        A_r0, A_r2, A_r1, A_r3,  // swap r1<->r2
-                        B_r0, B_r1,
-                        C_rmem[mt][nt][0], C_rmem[mt][nt][1],
-                        C_rmem[mt][nt][2], C_rmem[mt][nt][3]);
-                }
-            }
-        }
-    };
-
-    for (int kb = 0; kb < num_k_blocks; kb += 2) {
-        // Compute tile kb from buf[0]
-        compute_tile(smem_A, smem_B);
-
-        // Compute tile kb+1 from buf[1] (if it exists)
+        // Prefetch next K-tile
         if (kb + 1 < num_k_blocks) {
-            compute_tile(smem_A + A_SMEM_ELEMS, smem_B + B_SMEM_ELEMS);
+            int nxt = 1 - cur;
+            int k_start_nxt = (kb + 1) * GEMM_BLOCK_K;
+            load_A_tile(k_start_nxt, smem_A + nxt * A_SMEM_ELEMS);
+            load_B_tile(k_start_nxt, smem_B + nxt * B_SMEM_ELEMS);
         }
+        bk::cp_async_commit();
 
-        // Prefetch next 2 tiles
-        if (kb + 2 < num_k_blocks) {
-            load_A_tile((kb + 2) * GEMM_BLOCK_K, smem_A);
-            load_B_tile((kb + 2) * GEMM_BLOCK_K, smem_B);
-            bk::cp_async_commit();
-        }
-        if (kb + 3 < num_k_blocks) {
-            load_A_tile((kb + 3) * GEMM_BLOCK_K, smem_A + A_SMEM_ELEMS);
-            load_B_tile((kb + 3) * GEMM_BLOCK_K, smem_B + B_SMEM_ELEMS);
-            bk::cp_async_commit();
-        }
+        // Compute: preload ALL fragments for ALL K-chunks, then fire ALL MMAs
+        compute_full_tile<GEMM_MMA_M_TILES, GEMM_MMA_N_TILES, GEMM_MMA_K_TILES,
+                          GEMM_BLOCK_K, GEMM_BLOCK_N>(
+            C_rmem, A_cur, B_cur, warp_m_off, warp_n_off,
+            sub, t_in_sub, lane_id);
+
         bk::cp_async_wait<0>();
         __syncthreads();
-    } // end K-loop
+    }
 
     // ============================================================
-    // Epilogue: store C from FP32 accumulators to global memory as BF16
+    // Epilogue: store C — NO boundary checks (padded output)
     // ============================================================
-    // D-fragment layout: d0=C[T/4,(T%4)*2], d1=C[T/4,(T%4)*2+1],
-    //                    d2=C[T/4+8,(T%4)*2], d3=C[T/4+8,(T%4)*2+1]
     #pragma unroll
     for (int mt = 0; mt < GEMM_MMA_M_TILES; mt++) {
-        int row0 = bm + warp_id * GEMM_WARP_M + mt * 16 + (lane_id / 4);
+        int row0 = bm + warp_m_off + mt * 16 + (lane_id / 4);
         int row1 = row0 + 8;
 
         #pragma unroll
         for (int nt = 0; nt < GEMM_MMA_N_TILES; nt++) {
-            int col0 = bn + nt * 8 + (lane_id % 4) * 2;
+            int col0 = bn + warp_n_off + nt * 8 + (lane_id % 4) * 2;
 
-            int col1 = col0 + 1;
+            __nv_bfloat162 packed0 = __floats2bfloat162_rn(
+                C_rmem[mt][nt][0], C_rmem[mt][nt][1]);
+            *reinterpret_cast<uint32_t*>(&C[row0 * N + col0]) =
+                *reinterpret_cast<uint32_t*>(&packed0);
 
-            // Packed 4-byte store when both columns are in bounds
-            if (row0 < M && col1 < N) {
-                __nv_bfloat162 packed = __floats2bfloat162_rn(
-                    C_rmem[mt][nt][0], C_rmem[mt][nt][1]);
-                *reinterpret_cast<uint32_t*>(&C[row0 * N + col0]) =
-                    *reinterpret_cast<uint32_t*>(&packed);
-            } else if (row0 < M && col0 < N) {
-                C[row0 * N + col0] = __float2bfloat16_rn(C_rmem[mt][nt][0]);
-            }
-            if (row1 < M && col1 < N) {
-                __nv_bfloat162 packed = __floats2bfloat162_rn(
-                    C_rmem[mt][nt][2], C_rmem[mt][nt][3]);
-                *reinterpret_cast<uint32_t*>(&C[row1 * N + col0]) =
-                    *reinterpret_cast<uint32_t*>(&packed);
-            } else if (row1 < M && col0 < N) {
-                C[row1 * N + col0] = __float2bfloat16_rn(C_rmem[mt][nt][2]);
-            }
+            __nv_bfloat162 packed1 = __floats2bfloat162_rn(
+                C_rmem[mt][nt][2], C_rmem[mt][nt][3]);
+            *reinterpret_cast<uint32_t*>(&C[row1 * N + col0]) =
+                *reinterpret_cast<uint32_t*>(&packed1);
         }
     }
 }
@@ -282,10 +272,7 @@ void bf16_gemm_fwd(
     dim3 grid(grid_n, grid_m);
     dim3 block(GEMM_THREADS);
 
-    // Shared memory: 2*(A_tile + B_tile)
-    // A tile: BLOCK_M * BLOCK_K * sizeof(bf16) = 128*32*2 = 8KB
-    // B tile: BLOCK_K * BLOCK_N * sizeof(bf16) = 32*128*2 = 8KB
-    // Double-buffered: 2*(8+8) = 32KB — fits in 48KB static limit
+    // Shared memory: 2*(A_tile + B_tile) = 32KB
     constexpr int smem_bytes = 2 * (GEMM_BLOCK_M * GEMM_BLOCK_K +
                                      GEMM_BLOCK_K * GEMM_BLOCK_N) *
                                 sizeof(__nv_bfloat16);
@@ -301,7 +288,7 @@ void bf16_gemm_fwd(
 } // namespace bk
 
 // ============================================================
-// PyTorch bindings
+// PyTorch bindings — handles padding to exact tile multiples
 // ============================================================
 
 torch::Tensor bf16_gemm(torch::Tensor A, torch::Tensor B)
@@ -316,14 +303,38 @@ torch::Tensor bf16_gemm(torch::Tensor A, torch::Tensor B)
     int K = A.size(1);
     int N = B.size(1);
 
-    auto C = torch::empty({M, N}, A.options());  // BF16 output
+    // Pad to exact tile multiples — zero-padded math is still correct for GEMM
+    int M_pad = ((M + GEMM_BLOCK_M - 1) / GEMM_BLOCK_M) * GEMM_BLOCK_M;
+    int K_pad = ((K + GEMM_BLOCK_K - 1) / GEMM_BLOCK_K) * GEMM_BLOCK_K;
+    int N_pad = ((N + GEMM_BLOCK_N - 1) / GEMM_BLOCK_N) * GEMM_BLOCK_N;
+
+    bool needs_pad = (M != M_pad || K != K_pad || N != N_pad);
+
+    torch::Tensor A_padded, B_padded;
+    if (needs_pad) {
+        // Pad with zeros — C_padded = A_padded * B_padded still gives correct
+        // result in the [0:M, 0:N] submatrix because zeros don't contribute
+        A_padded = torch::zeros({M_pad, K_pad}, A.options());
+        A_padded.narrow(0, 0, M).narrow(1, 0, K).copy_(A);
+        B_padded = torch::zeros({K_pad, N_pad}, B.options());
+        B_padded.narrow(0, 0, K).narrow(1, 0, N).copy_(B);
+    } else {
+        A_padded = A;
+        B_padded = B;
+    }
+
+    auto C_padded = torch::empty({M_pad, N_pad}, A.options());
 
     bk::bf16_gemm_fwd(
-        reinterpret_cast<const __nv_bfloat16 *>(A.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16 *>(B.data_ptr()),
-        reinterpret_cast<__nv_bfloat16 *>(C.data_ptr()),
-        M, N, K,
+        reinterpret_cast<const __nv_bfloat16 *>(A_padded.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16 *>(B_padded.data_ptr()),
+        reinterpret_cast<__nv_bfloat16 *>(C_padded.data_ptr()),
+        M_pad, N_pad, K_pad,
         at::cuda::getCurrentCUDAStream());
 
-    return C;
+    // Extract the unpadded result
+    if (needs_pad) {
+        return C_padded.narrow(0, 0, M).narrow(1, 0, N).contiguous();
+    }
+    return C_padded;
 }
