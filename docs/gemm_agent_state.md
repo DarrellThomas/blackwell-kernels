@@ -1,6 +1,6 @@
 # GEMM Kernel — Optimization State
 
-**Last updated:** 2026-03-12 (experiment 38)
+**Last updated:** 2026-03-12 (experiment 51)
 **Goal:** Match or beat cuBLAS on RTX 5090 (sm_120)
 
 -----
@@ -45,29 +45,58 @@ Global --[cp.async 16B]--> Shared (XOR swizzle, double-buffered)
 
 Benchmark: M=N=K=4096, BF16, 10 warmup + 100 timed iterations.
 
+Interesting: on 4096×1024×4096, our kernel achieves **1.09x cuBLAS** (209 us vs 226 us).
+
 -----
 
 ## Diagnosis
 
-The kernel is **compute-bound** (math_pipe_throttle is the dominant stall). This means the tensor core input FIFO fills in bursts, then starves during load/sync phases. Memory is not the bottleneck.
+The kernel is **compute-bound** (math_pipe_throttle is the dominant stall at 44-59%). The SASS shows the compiler already does excellent scheduling — HMMA and LDSM are perfectly interleaved in the inner loop.
 
-**0.89x cuBLAS appears to be near the ceiling for the current mma.sync approach.** 38 experiments have explored scheduling, tiling, buffering, and barrier optimization within the current architecture. The remaining gap likely requires either:
+**0.89x cuBLAS is the ceiling for compiler-generated mma.sync code.** 51 experiments have exhausted all conventional approaches:
 
-1. Better MMA-to-load interleaving (spreading MMAs across time instead of bursting)
-2. Larger output tiles per warp (more independent MMAs between sync points — see spatters.ca 3.0→3.1 jump)
-3. A fundamentally different instruction path (wgmma if available on sm_120)
+### Exhaustively Explored (all regressed or neutral)
+- **Tile sizes**: 128×128 (optimal), 128×64, 256×64, 256×128, 128×256 — all worse
+- **BLOCK_K**: 32 (optimal), 64 (too much data/load)
+- **Warps**: 4 (too few), 8 (optimal), 16 (race condition)
+- **Pipeline stages**: 2 (optimal), 3 (occupancy/L1 loss), 4 (too much smem)
+- **K-loop unroll**: 1 (too many syncs), 2 (optimal), 3 (conditional overhead)
+- **Warp tiling**: 1D (optimal), 2D (bank conflicts from more A loads)
+- **B fragment pipelining**: compiler already interleaves optimally
+- **A/B preloading**: compiler already does it; full preload (164 regs) disrupts scheduling
+- **Loop reordering**: kc↔nt, compiler produces same code
+- **Padding/stride**: alignment issues or perf loss
+- **Register swap elimination**: different sub-group mapping → worse bank conflicts
+- **Partial unroll**: any non-full unroll → catastrophic (0.12x)
+- **Compiler flags**: -O2 vs -O3 identical, __builtin_assume no effect
+- **wgmma**: not available on sm_120 ("not supported on .target 'sm_120'")
+
+### cuBLAS Comparison
+| Metric | Our Best (128×128) | cuBLAS (256×128) |
+|--------|-------------------|------------------|
+| Duration | 808 us | ~719 us |
+| Registers | 123 | 218 |
+| math_throttle | 44-59% | 72% |
+| wait | 14-19% | 21% |
+| barrier | 4-5% | 0% |
+| scoreboard | 8-15% | 0% |
+| bank_conflicts | 8.6M | 524K |
+
+cuBLAS achieves 0% barrier/scoreboard through CUTLASS 2.x's hand-tuned pipeline management and 218 registers for aggressive preloading. Our kernel has 8.6M bank conflicts on A loads (inherent with BLOCK_K=32, SWIZZLE_BITS=2, only 4 unique patterns).
 
 -----
 
-## Next Directions to Explore
+## Remaining Path to 1.0x
 
-**Check `04_HARD_WON_LESSONS.md` before attempting anything** — 38 experiments worth of dead ends are documented there with root causes.
+The only unexplored path to close the 11% gap:
 
-1. **Larger per-warp output tiles** — current: 1x16 MMA tiles (16x128). Increasing M tiling to 2x16 (32x128) gives 2x more independent MMAs per K iteration. Spatters.ca saw their biggest late-stage jump (89%→93% peak) from 2x2→4x4 tiling.
+**Full inner-loop PTX** — write the entire compute_tile in a single large `asm` block with manual register allocation and instruction scheduling. This is what CUTLASS/cuBLAS effectively does. Benefits:
+1. Eliminate the a1/a2 swap MOVs (saves ~16 instructions per K-iteration)
+2. Custom interleaving of LDSM and HMMA with exact stall control
+3. Explicit B register rotation without compiler interference
+4. Potentially better scoreboard management
 
-2. **Full inner-loop PTX** — the compiler is good but not perfect at interleaving MMA with loads. A single large `asm` block with manual register allocation could spread MMAs across load phases. This is the salykova/spatters approach for the last ~5%.
-
-3. **Investigate wgmma availability on sm_120** — `wgmma.mma_async` (warp-group level, smem→tensor cores directly) may be available on consumer Blackwell. If so, it bypasses the register bottleneck entirely. Needs PTX ISA investigation and `ptxas --gpu-name sm_120` testing.
+This is a major undertaking (~500+ lines of inline PTX). The salykova approach for SGEMM provides a template.
 
 -----
 
@@ -76,4 +105,4 @@ The kernel is **compute-bound** (math_pipe_throttle is the dominant stall). This
 - [spatters.ca MMA matmul](../docs/reference_spatters_mma_matmul.md) — 93% peak on Ada via tiling + cp.async, most applicable reference
 - [math throttle guide](../docs/math_throttle_optimization.md) — diagnosis and strategies for the current stall pattern
 - [hard-won lessons](../.claude/04_HARD_WON_LESSONS.md) — empirical constraints, do not contradict
-- CUTLASS 3.x: https://github.com/NVIDIA/cutlass (wgmma reference)
+- CUTLASS 3.x: https://github.com/NVIDIA/cutlass (wgmma reference — NOT available on sm_120)
