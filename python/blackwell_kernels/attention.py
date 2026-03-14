@@ -75,6 +75,22 @@ def flash_attn_v3_sm120(
     return flash_attn_v3_forward(Q, K, V, scale, causal)
 
 
+def flash_attn_v4_sm120(
+    Q: torch.Tensor,  # [B, H, N, D] BF16
+    K: torch.Tensor,  # [B, H, N, D] BF16
+    V: torch.Tensor,  # [B, H, N, D] BF16
+    causal: bool = False,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Flash attention v4 forward pass — full PTX inner loop on sm_120."""
+    from blackwell_kernels._C import flash_attn_v4_forward
+
+    if scale is None:
+        scale = Q.shape[-1] ** -0.5
+
+    return flash_attn_v4_forward(Q, K, V, scale, causal)
+
+
 def flash_attn_fp8_sm120(
     Q: torch.Tensor,  # [B, H, N, D] BF16
     K: torch.Tensor,  # [B, H, N, D] BF16

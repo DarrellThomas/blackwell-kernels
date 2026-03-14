@@ -295,6 +295,11 @@ torch::Tensor flash_attn_fp8_forward(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     float scale, bool causal);
 
+// Declared in flash_attn_v4_sm120.cu
+torch::Tensor flash_attn_v4_forward(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V,
+    float scale, bool causal);
+
 // Declared in bf16_gemm_sm120.cu
 torch::Tensor bf16_gemm(torch::Tensor A, torch::Tensor B);
 
@@ -314,6 +319,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("scale"), py::arg("causal") = false);
     m.def("flash_attn_fp8_forward", &flash_attn_fp8_forward,
           "Flash Attention forward FP8 (sm_120, e4m3 m16n8k32)",
+          py::arg("Q"), py::arg("K"), py::arg("V"),
+          py::arg("scale"), py::arg("causal") = false);
+    m.def("flash_attn_v4_forward", &flash_attn_v4_forward,
+          "Flash Attention forward v4 (sm_120, full PTX inner loop)",
           py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("scale"), py::arg("causal") = false);
     m.def("bf16_gemm", &bf16_gemm,

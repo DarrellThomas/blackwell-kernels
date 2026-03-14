@@ -127,6 +127,33 @@ Six approaches tested, all correct pieces individually validated, but no speedup
 
 **Conclusion:** Incremental PTX (replacing individual phases with inline asm while keeping the C++ operand interface) cannot beat the compiler for this attention kernel. The next step requires either (a) full salykova-style PTX with zero C++ interface, or (b) FP8 attention which changes the arithmetic intensity ratio fundamentally.
 
+### v4 Zero-Interface PTX (2026-03-13, experiment 61)
+
+Full salykova-style PTX: entire KV loop + output store in a single `asm volatile` block with **ZERO "+f" outputs**. All state in `.reg`, outputs via `st.global` from within PTX. 42 inputs (all "r"/"l"), 0 outputs.
+
+**Result: 69 μs — performance-neutral vs v2.** ptxas still controls instruction scheduling regardless of whether operands cross the asm boundary. The "+f" output interface was NOT the source of the compiler ceiling. The fundamental bottleneck is math_pipe_throttle from the softmax phase (~48% of stalls).
+
+**This definitively closes the PTX optimization path.** All three approaches — incremental PTX (v3), monolithic with "+f" (v4 first attempt), and zero-interface (v4 final) — produce identical performance. The compiler+ptxas combo is at 94% of its theoretical ceiling for BF16 attention.
+
+---
+
+## FP8 Conversion — The Vectorized CVT Discovery
+
+**`cvt.rn.satfinite.e4m3x2.f32` WORKS on sm_120.** The original `fp8_convert.cuh` comment claimed "sm_120 does NOT support PTX cvt.e4m3x2.bf16x2 or cvt.e4m3x2.f32." **This was HALF WRONG:**
+
+| Instruction | sm_120 Support | Verified |
+|-------------|---------------|----------|
+| `cvt.rn.satfinite.e4m3x2.f32 d, hi, lo` | **YES** | Compiles, runs, correct output |
+| `cvt.rn.satfinite.e4m3x2.bf16x2 d, src` | **NO** | ptxas error: "not supported on sm_120" |
+
+**The f32 variant has REVERSED operand order** (same as `cvt.rn.bf16x2.f32`): first source → HIGH byte, second source → LOW byte. To get `{fp8(a), fp8(b)}`, pass `(b, a)`.
+
+**Impact:** The scalar FP8 conversion path (`__nv_fp8_e4m3` constructor + manual byte packing) generated ~11 instructions per uint32. The vectorized path uses one `cvt.e4m3x2.f32` instruction per pair, reducing to ~7 instructions per uint32.
+
+**This wrong comment cost the entire FP8 attention path.** With scalar conversions, FP8 attention ran at 0.080ms (0.87x of BF16 v2 — **slower**). The conversion overhead exceeded the 2x MMA throughput gain. With vectorized CVT, FP8 runs at **0.056ms (1.24x of BF16 v2)** — a 30% speedup.
+
+**Rule: Always test PTX instructions empirically on sm_120.** The ISA docs say sm_89+ but sm_120 is a different microarchitecture. Some instructions work, some don't. The only way to know is to compile and run.
+
 ---
 
 ## Current Performance (2026-03-13)
@@ -136,13 +163,28 @@ Six approaches tested, all correct pieces individually validated, but no speedup
 - **1.23x cuBLAS** at 4096×1024×4096 (beats cuBLAS on non-square)
 - 64×64 tiles, 4 warps, 80 regs, 6 blocks/SM, non-volatile MMA, streaming B
 
-### Flash Attention v2
+### Flash Attention v2 (BF16)
 - **1.76x cuDNN SDPA** at B=2 H=8 N=2048 D=64 causal (69 μs)
 - **1.35x SDPA** at N=512, **1.15x** at N=4096, **1.00x** at D=128
 - 145 regs, 3 blocks/SM, 12 warps. At 94% of compiler ceiling.
-- Code cleanup: non-volatile MMA + ldmatrix_x4_mma (performance-neutral, cleaner)
+- BF16 optimization exhausted: 53 C++ experiments + 7 PTX experiments, all converged.
+
+### Flash Attention FP8 (NEW BEST)
+- **1.65x cuDNN SDPA** at B=2 H=8 N=2048 D=64 causal (56 μs)
+- **2.79x SDPA** at N=512, **1.85x** at N=1024
+- 1.24x faster than BF16 v2 across all configs
+- Uses `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` (2x MMA throughput)
+- Vectorized `cvt.rn.satfinite.e4m3x2.f32` for BF16→FP8 conversion (critical discovery)
+- Higher error than BF16 (max_err ~0.16 vs ~0.002) — acceptable for training
+
+| B | H | N | D | SDPA (ms) | v2 BF16 (ms) | FP8 (ms) | FP8/v2 | FP8/SDPA |
+|---|---|---|---|-----------|-------------|----------|--------|----------|
+| 2 | 8 | 512 | 64 | 0.029 | 0.012 | 0.010 | **1.20x** | **2.79x** |
+| 2 | 8 | 1024 | 64 | 0.049 | 0.033 | 0.027 | **1.25x** | **1.85x** |
+| 2 | 8 | 2048 | 64 | 0.092 | 0.069 | 0.056 | **1.24x** | **1.65x** |
+| 2 | 8 | 4096 | 64 | 0.176 | 0.279 | 0.228 | **1.23x** | **0.78x** |
 
 ### Reference Points
 **gau-nernst** wrote custom flash attention for RTX 5090 and achieved 94.4% of 209.5 TFLOPS peak using BLOCK_Q=128. This is our feasibility proof — we know sm_120 can get there.
 
-**cuDNN SDPA** achieves 97.2% of peak. We beat it on D=64 configs (1.35-1.76x) but match at D=128 (1.00x).
+**cuDNN SDPA** achieves 97.2% of peak. We beat it on D=64 configs (1.35-2.79x) with both BF16 and FP8.
