@@ -288,6 +288,9 @@ torch::Tensor flash_attn_v2_forward(
 // Declared in bf16_gemm_sm120.cu
 torch::Tensor bf16_gemm(torch::Tensor A, torch::Tensor B);
 
+// Declared in fp8_gemm_sm120.cu
+torch::Tensor fp8_gemm(torch::Tensor A, torch::Tensor B);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("flash_attn_forward", &flash_attn_forward,
@@ -300,5 +303,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("scale"), py::arg("causal") = false);
     m.def("bf16_gemm", &bf16_gemm,
           "BF16 GEMM (sm_120, MMA tensor cores)",
+          py::arg("A"), py::arg("B"));
+    m.def("fp8_gemm", &fp8_gemm,
+          "FP8 GEMM (sm_120, MMA m16n8k32, BF16 in/out)",
           py::arg("A"), py::arg("B"));
 }
