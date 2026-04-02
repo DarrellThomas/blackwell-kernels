@@ -110,6 +110,28 @@ __device__ __forceinline__ void mma_m16n8k32_e4m3_nv(
           "f"(c0), "f"(c1), "f"(c2), "f"(c3));
 }
 
+// FP8 MMA with FP16 accumulators — runs at FULL throughput on sm_120a
+// (FP32 accumulators run at 50% throughput per hard-won-lessons)
+// D: 2x uint32_t (each holds 2 packed f16 values = 4 total per thread)
+// Layout: d0 = {f16[row0,col0], f16[row0,col0+1]}, d1 = {f16[row1,col0], f16[row1,col0+1]}
+__device__ __forceinline__ void mma_m16n8k32_e4m3_f16_nv(
+    uint32_t &d0, uint32_t &d1,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1,
+    uint32_t c0, uint32_t c1)
+{
+    asm(
+        "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 "
+        "{%0, %1}, "
+        "{%2, %3, %4, %5}, "
+        "{%6, %7}, "
+        "{%8, %9};\n"
+        : "=r"(d0), "=r"(d1)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+          "r"(b0), "r"(b1),
+          "r"(c0), "r"(c1));
+}
+
 __device__ __forceinline__ void mma_m16n8k32_e5m2(
     float &d0, float &d1, float &d2, float &d3,
     uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,

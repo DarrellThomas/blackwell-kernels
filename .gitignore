@@ -60,6 +60,7 @@ foreman-staff/researcher/cache/
 *.bak[0-9]*
 *~
 .DS_Store
+*.code-workspace
 
 # ── Secrets — NEVER commit ────────────────────────────────────────────────────
 .env

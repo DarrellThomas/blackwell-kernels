@@ -167,6 +167,7 @@ def gate_process_job(job_id):
             gate_output.append(note)
             all_passed = False
 
+        missing_categories = []
         for category in ALL_TEST_CATEGORIES:
             candidate = find_test_file(project_dir, kernel, category, executed_files)
             if candidate:
@@ -177,12 +178,27 @@ def gate_process_job(job_id):
                 if not ok:
                     gate_output.append(f'{candidate.name} FAILED ({category}): {trace}')
             else:
-                note = f'No {category} test script found'
-                mem.record_test_run(jid, kernel, category, '<missing>', 'skipped', note)
-                gate_output.append(note)
-                all_passed = False
+                mem.record_test_run(jid, kernel, category, '<missing>', 'skipped', f'No {category} test script found')
+                missing_categories.append(category)
 
-        if all_passed:
+        if missing_categories and all_passed:
+            # Existing tests all pass but some suites haven't been written yet.
+            # This is normal for a newly minted algo — route to tests_writing so
+            # the worker builds them rather than treating absence as failure.
+            cats = ', '.join(missing_categories)
+            body = (
+                f"Write missing test suites: {cats}.\n"
+                f"Use tests/ dir. For Octave work, create a thin Python wrapper in tests/ "
+                f"that invokes octave-cli and exits with its return code.\n"
+                f"Reference: linalg/tests/test_edge_cases.py, gemm/tests/test_edge_cases.py\n"
+                f"When all suites exist and pass locally, advance job to testing_pass."
+            )
+            mem.update_job_state(jid, 'tests_writing', 'gate', f'missing test suites: {cats}')
+            if kernel: update_phase_context(kernel, 'tests_writing')
+            mem.ensure_open_message('gate', f'Test suites needed for {name}',
+                body=body, job_id=jid, message_type='directive', priority='normal')
+            print(f'  → tests_writing: missing {cats}')
+        elif all_passed:
             mem.update_job_state(jid, 'edge_pass', 'gate', 'compliance + gate tests passed')
             print(f'  → ALL tests PASSED')
         else:
