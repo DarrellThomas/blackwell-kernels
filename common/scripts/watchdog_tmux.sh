@@ -174,11 +174,16 @@ is_worker_idle() {
     local session="$1"
     local pane_text
     pane_text=$(capture_pane_tail "$session" 20)
+    # Codex always shows › in its UI even while actively executing — check active
+    # markers first. "Working (" and "esc to interrupt" mean Codex is mid-task.
+    if echo "$pane_text" | grep -Eq 'Working \(|esc to interrupt|Ran |Updated |Reading '; then
+        return 1  # not idle
+    fi
     if echo "$pane_text" | grep -Eq '[❯›]'; then
-        return 0
+        return 0  # idle at prompt
     fi
     if echo "$pane_text" | grep -Eq '^[^[:space:]@]+@[^[:space:]]+:.+[#$] ?$'; then
-        return 0
+        return 0  # idle at shell prompt
     fi
     return 1
 }

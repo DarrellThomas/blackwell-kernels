@@ -25,7 +25,7 @@ export PYTHONPATH="$COMMON_DIR/memory:$COMMON_DIR/scripts${PYTHONPATH:+:$PYTHONP
 # --- Configuration ---
 MAX_ITERS=1                     # Clear after every iteration (fresh context each cycle)
 STALL_TIMEOUT=9000              # Restart if no new iteration in N seconds (2.5 hrs)
-IDLE_TIMEOUT=120                # Restart if worker idle at prompt for N seconds (2 min)
+IDLE_TIMEOUT=900                # Restart if worker idle at prompt for N seconds (15 min)
 ACTIVE_SIT_TIMEOUT=300          # Flag active-lane jobs with no live heartbeat for N seconds
 SHORT_LOOP_INTERVAL=60          # scheduler / gate / worker nudges
 MEDIUM_LOOP_INTERVAL=1800       # ingest changed content / metadata hygiene

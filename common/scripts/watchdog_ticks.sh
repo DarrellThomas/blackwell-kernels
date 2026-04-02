@@ -149,6 +149,32 @@ for job in mem.get_jobs():
 mem.close()
 PY
     log_watchdog tick medium "metadata hygiene complete"
+
+    # Deduplicate open messages. Workers use message-create (always-insert) rather
+    # than ensure_open_message, so repeated restarts generate duplicates. Keep only
+    # the latest per (from_agent, subject, job_id) group.
+    python3 - <<'PY' 2>/dev/null | sed 's/^/[watchdog][hygiene] /' || true
+import os, sqlite3
+db = os.path.join(os.environ['COMMON_DIR'], 'memory', 'research.db')
+conn = sqlite3.connect(db)
+cur = conn.cursor()
+cur.execute("""
+    DELETE FROM messages
+    WHERE status = 'open'
+    AND id NOT IN (
+        SELECT MAX(id)
+        FROM messages
+        WHERE status = 'open'
+        GROUP BY from_agent, subject, COALESCE(job_id, -1)
+    )
+""")
+n = cur.rowcount
+conn.commit()
+conn.close()
+if n:
+    print(f"deduped {n} open messages")
+PY
+    log_watchdog tick medium "message dedup complete"
 }
 
 tick_long() {
