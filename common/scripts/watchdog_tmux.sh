@@ -18,27 +18,22 @@ classify_pane_state() {
     local pane_text
     pane_text="$(capture_pane_tail "$session" 50)"
 
-    # Codex upgrade selection menu (GPT-5.4 prompt)
-    if echo "$pane_text" | grep -Eq 'Try new model|Use existing model|Introducing GPT-5\.4'; then
-        echo "codex_upgrade"
-        return 0
-    fi
-
-    if echo "$pane_text" | grep -Eq 'Working \(|esc to interrupt|Ran |Updated |Reading |thinking|Tokens? usage:'; then
+    # Claude active: thinking spinner, tool output, or token usage line
+    if echo "$pane_text" | grep -Eq '⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Tokens?|esc to interrupt|Running |Reading |Writing |Executing '; then
         echo "active"
         return 0
     fi
 
-    if echo "$pane_text" | grep -Eq 'To continue this session, run codex resume '; then
-        echo "expired"
+    # Codex active markers (kept for forward-compat if Codex is re-enabled)
+    if echo "$pane_text" | grep -Eq 'Working \(|Ran |Updated '; then
+        echo "active"
         return 0
     fi
 
-    if echo "$pane_text" | grep -Eq "Tip: .*Codex|OpenAI Codex \(v|model: .* /model to change|directory: ${REPO_ROOT}"; then
-        if echo "$pane_text" | grep -Eq "Implement \{feature\}|Write tests for @filename|Explain this codebase|gpt-5\.4 .* ${REPO_ROOT}"; then
-            echo "codex_welcome"
-            return 0
-        fi
+    # Claude idle prompt
+    if echo "$pane_text" | grep -Fq '❯ '; then
+        echo "claude_idle"
+        return 0
     fi
 
     if echo "$pane_text" | grep -Eq '^[^[:space:]@]+@[^[:space:]]+:.+[#$] ?$'; then
@@ -46,13 +41,9 @@ classify_pane_state() {
         return 0
     fi
 
+    # Codex composer prompt (kept for forward-compat)
     if echo "$pane_text" | grep -Fq '› '; then
         echo "composer"
-        return 0
-    fi
-
-    if echo "$pane_text" | grep -Fq '❯ '; then
-        echo "claude_idle"
         return 0
     fi
 
@@ -64,28 +55,23 @@ confirm_execution_started() {
     local pane_text
     pane_text="$(capture_pane_tail "$session" 50)"
 
-    if echo "$pane_text" | grep -Eq 'Try new model|Use existing model|Introducing GPT-5\.4'; then
-        tmux send-keys -t "$session" "1" C-m 2>/dev/null
+    # Still at idle prompt — not started
+    if echo "$pane_text" | grep -Fq '❯ '; then
         return 1
     fi
 
-    if echo "$pane_text" | grep -Eq 'To continue this session, run codex resume '; then
-        return 1
-    fi
-
-    if echo "$pane_text" | grep -Eq 'Implement \{feature\}|Write tests for @filename|Explain this codebase'; then
-        return 1
-    fi
-
+    # Prompt text still visible in input — not submitted yet
     if echo "$pane_text" | grep -Fq "$prompt"; then
         return 1
     fi
 
-    if echo "$pane_text" | grep -Fq '› '; then
-        return 1
+    # Claude active indicators
+    if echo "$pane_text" | grep -Eq '⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Tokens?|esc to interrupt|Running |Reading |Writing '; then
+        return 0
     fi
 
-    if echo "$pane_text" | grep -Eq 'Working \(|esc to interrupt|Ran |Updated |Reading |thinking'; then
+    # Codex active (forward-compat)
+    if echo "$pane_text" | grep -Eq 'Working \(|Ran |Updated '; then
         return 0
     fi
 
@@ -101,26 +87,22 @@ submit_prompt_and_confirm() {
         log_watchdog prompt "$session" "state=$state try=$((tries + 1))"
 
         case "$state" in
-            codex_upgrade)
-                tmux send-keys -t "$session" "1" C-m 2>/dev/null
-                sleep 1
-                continue
-                ;;
             active)
                 return 0
                 ;;
-            shell|claude_idle)
+            claude_idle)
                 tmux send-keys -t "$session" '/clear' C-m 2>/dev/null
                 sleep 1
                 tmux set-buffer -- "$prompt"
                 tmux paste-buffer -t "$session" 2>/dev/null
                 tmux send-keys -t "$session" C-m 2>/dev/null
                 ;;
-            codex_welcome|unknown)
+            shell|unknown)
                 tmux set-buffer -- "$prompt"
                 tmux paste-buffer -t "$session" 2>/dev/null
                 tmux send-keys -t "$session" C-m 2>/dev/null
                 ;;
+            # Codex states kept for forward-compat if Codex is re-enabled
             composer)
                 if ! capture_pane_tail "$session" 20 | grep -Fq "$prompt"; then
                     tmux set-buffer -- "$prompt"
@@ -147,17 +129,23 @@ submit_prompt_and_confirm() {
     return 1
 }
 
-is_codex_launch_cmd() {
+is_cli_launch_cmd() {
     local launch_cmd="${1:-}"
-    [[ "$launch_cmd" == codex* ]]
+    [[ "$launch_cmd" == claude* || "$launch_cmd" == codex* ]]
 }
 
-launch_codex_fresh() {
+# Keep old name as alias so watchdog_workers.sh callers don't break
+is_codex_launch_cmd() { is_cli_launch_cmd "$@"; }
+
+launch_cli_fresh() {
     local session="$1" launch_cmd="$2" prompt="$3"
     local launch_line
     printf -v launch_line '%s %q' "$launch_cmd" "$prompt"
     tmux send-keys -t "$session" "$launch_line" C-m 2>/dev/null
 }
+
+# Keep old name as alias
+launch_codex_fresh() { launch_cli_fresh "$@"; }
 
 is_session_alive() {
     local session="$1"

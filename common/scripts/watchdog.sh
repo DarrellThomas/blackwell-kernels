@@ -72,10 +72,12 @@ load_managed_worker_slots() {
 # - `cwd` defaults to `$REPO_ROOT/<name>` when omitted.
 # Add new projects here when onboarding.
 LOOPS=(
-    # Active Codex-managed workers.
+    # Worker launch_cmd — either Claude or Codex:
+    #   claude --dangerously-skip-permissions
+    #   codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen
     # Format: name|tmux_session|legacy_results_tsv|resume_cmd|launch_cmd|cwd
-    "gemm|gemm|$REPO_ROOT/gemm/results/gemm.tsv|@active-prompt:gemm|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/gemm"
-    "octave-gpu|octave-gpu||@active-prompt:octave-gpu|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/octave-gpu"
+    "gemm|gemm|$REPO_ROOT/gemm/results/gemm.tsv|@active-prompt:gemm|claude --dangerously-skip-permissions|$REPO_ROOT/gemm"
+    "octave-gpu|octave-gpu||@active-prompt:octave-gpu|claude --dangerously-skip-permissions|$REPO_ROOT/octave-gpu"
 
     # --- NEVER add this — chess-training is Darrell's live ML training, not a worker ---
     # chess-training: RNN training in progress, not a kernel optimization loop
@@ -91,7 +93,8 @@ LOOPS=(
 #
 # Researcher gets a nudge if idle — it's pull-based (only runs when kicked).
 STAFF_LOOPS=(
-    "researcher|researcher|Read your open messages in the factory DB and handle only those bounded research requests. Stay pull-based, keep outputs concise, and do not proactively fan work out to workers.|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/foreman-staff/researcher"
+    # Same claude/codex choice applies here
+    "researcher|researcher|Read your open messages in the factory DB and handle only those bounded research requests. Stay pull-based, keep outputs concise, and do not proactively fan work out to workers.|claude --dangerously-skip-permissions|$REPO_ROOT/foreman-staff/researcher"
 )
 
 # --- Source helper modules ---
