@@ -1,0 +1,1 @@
+../../common/docs/reference_ptx_gemm_inner_loops.md

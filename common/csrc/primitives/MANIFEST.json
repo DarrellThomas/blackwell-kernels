@@ -1,0 +1,170 @@
+{
+  "gemm/bf16_gemm_sm120.cu": {
+    "hash": "a9bf4d8b220230e8",
+    "size": 13914,
+    "has_blas_interface": false,
+    "shipped_at": 1774773583.7409708,
+    "version": 1
+  },
+  "gemm/dgemm_sm120.cu": {
+    "hash": "1de9009b8a56461d",
+    "size": 11861,
+    "has_blas_interface": true,
+    "shipped_at": 1774772948.5675495,
+    "version": 1
+  },
+  "gemm/fp8_gemm_sm120.cu": {
+    "hash": "5e9439d47db4dca6",
+    "size": 13940,
+    "has_blas_interface": false,
+    "shipped_at": 1774773583.757971,
+    "version": 1
+  },
+  "linalg/batched_gemm_fp8_sm120.cu": {
+    "hash": "9996ebbe2fa47869",
+    "size": 14488,
+    "has_blas_interface": true,
+    "shipped_at": 1774773269.1399534,
+    "version": 1
+  },
+  "linalg/batched_gemm_sm120.cu": {
+    "hash": "3aa833788f371de0",
+    "size": 24227,
+    "has_blas_interface": true,
+    "shipped_at": 1774771224.1373146,
+    "version": 1
+  },
+  "linalg/batched_gemv_sm120.cu": {
+    "hash": "b27da9f97261c876",
+    "size": 4650,
+    "has_blas_interface": true,
+    "shipped_at": 1774773269.1419532,
+    "version": 1
+  },
+  "linalg/blas1_sm120.cu": {
+    "hash": "89afd997a66619a5",
+    "size": 14365,
+    "has_blas_interface": true,
+    "shipped_at": 1774742647.242369,
+    "version": 1
+  },
+  "linalg/dbatched_gemm_sm120.cu": {
+    "hash": "bc9a8ab71671807c",
+    "size": 10292,
+    "has_blas_interface": true,
+    "shipped_at": 1774742647.252369,
+    "version": 1
+  },
+  "linalg/dblas1_sm120.cu": {
+    "hash": "1436600bf6a8f82b",
+    "size": 30684,
+    "has_blas_interface": true,
+    "shipped_at": 1774742647.263369,
+    "version": 1
+  },
+  "linalg/dblas2_extra_sm120.cu": {
+    "hash": "1d1040e0fd7c55f0",
+    "size": 7719,
+    "has_blas_interface": true,
+    "shipped_at": 1774771224.1403146,
+    "version": 1
+  },
+  "linalg/dgemm_sm120.cu": {
+    "hash": "1de9009b8a56461d",
+    "size": 11861,
+    "has_blas_interface": true,
+    "shipped_at": 1774772948.5685494,
+    "version": 1
+  },
+  "linalg/dgemv_sm120.cu": {
+    "hash": "44db3e85b4eed131",
+    "size": 5149,
+    "has_blas_interface": true,
+    "shipped_at": 1774742647.280369,
+    "version": 1
+  },
+  "linalg/dsyrk_sm120.cu": {
+    "hash": "53dc106f98d5062e",
+    "size": 11468,
+    "has_blas_interface": true,
+    "shipped_at": 1774724721.11008,
+    "version": 1
+  },
+  "linalg/dtrmm_sm120.cu": {
+    "hash": "e0b086b31b705647",
+    "size": 9444,
+    "has_blas_interface": true,
+    "shipped_at": 1774773269.1429534,
+    "version": 1
+  },
+  "linalg/gemm_f32_sm120.cu": {
+    "hash": "a460d3d631e88fd6",
+    "size": 15072,
+    "has_blas_interface": true,
+    "shipped_at": 1774726413.006049,
+    "version": 1
+  },
+  "linalg/gemv_sm120.cu": {
+    "hash": "d0d03bfad6f7c1ef",
+    "size": 5891,
+    "has_blas_interface": true,
+    "shipped_at": 1774742647.3193693,
+    "version": 1
+  },
+  "linalg/permute_sm120.cu": {
+    "hash": "4a52bc6e2311b64c",
+    "size": 5390,
+    "has_blas_interface": false,
+    "shipped_at": 1774694292.9019365,
+    "version": 1
+  },
+  "linalg/syrk_f32_sm120.cu": {
+    "hash": "926a0b73df0ef1d1",
+    "size": 17556,
+    "has_blas_interface": true,
+    "shipped_at": 1774726413.0070488,
+    "version": 1
+  },
+  "linalg/syrk_sm120.cu": {
+    "hash": "207e936741fada34",
+    "size": 18963,
+    "has_blas_interface": true,
+    "shipped_at": 1774742647.3483694,
+    "version": 1
+  },
+  "linalg/trmm_sm120.cu": {
+    "hash": "0d3b182a2559471d",
+    "size": 13288,
+    "has_blas_interface": true,
+    "shipped_at": 1774773269.1439533,
+    "version": 1
+  },
+  "linalg/trsm_f32_sm120.cu": {
+    "hash": "6202acbaa663499c",
+    "size": 1062,
+    "has_blas_interface": true,
+    "shipped_at": 1774724721.1960802,
+    "version": 1
+  },
+  "linalg/trsm_sm120.cu": {
+    "hash": "63ad0faae8fd37c8",
+    "size": 1046,
+    "has_blas_interface": false,
+    "shipped_at": 1773517823.169593,
+    "version": 1
+  },
+  "qr/qr_sm120.cu": {
+    "hash": "a33344dbded8e014",
+    "size": 32014,
+    "has_blas_interface": true,
+    "shipped_at": 1774773583.953972,
+    "version": 1
+  },
+  "spmv/spmv_sm120.cu": {
+    "hash": "3d3cbca326fd5787",
+    "size": 39198,
+    "has_blas_interface": false,
+    "shipped_at": 1774773583.9709723,
+    "version": 1
+  }
+}

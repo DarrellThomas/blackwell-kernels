@@ -1,0 +1,57 @@
+# ── Existing kernel worktrees (own git history via main/) ────────────────────
+# These stay in the main/ worktree system until they ship and are archived.
+main/
+attention/
+chess-training/
+cuquantum/
+dotproduct/
+fused-mlp/
+gemm/
+linalg/
+lu/
+numerical/
+qr/
+rmsnorm/
+spmv/
+ui/
+
+# ── Client projects (own repos, not factory infrastructure) ──────────────────
+octave-gpu/
+
+# ── Explicitly excluded runtime dirs ─────────────────────────────────────────
+logs/
+data/
+for_darrell/
+
+# ── Factory database (live, not versioned) ────────────────────────────────────
+common/memory/research.db
+common/memory/*.bak
+common/memory/*.step
+common/memory/*.backup*
+common/memory/factory_brain.backup*.py
+
+# ── Compiled artifacts ────────────────────────────────────────────────────────
+common/csrc/primitives/lib/
+**/*.o
+**/*.so
+**/*.a
+**/*.oct
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# ── Research cache (large PDFs and downloads) ─────────────────────────────────
+foreman-staff/researcher/cache/
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.bak
+*~
+.DS_Store
+
+# ── Secrets — NEVER commit ────────────────────────────────────────────────────
+.env
+*.env
+.credentials*
+*_secret*

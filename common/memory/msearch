@@ -1,0 +1,201 @@
+#!/bin/bash
+# msearch — Memory Search for blackwell-kernels factory
+#
+# Lightweight wrapper that queries the research memory HTTP API.
+# No Python, no model loading — instant results.
+#
+# Three-tier progressive disclosure:
+#   msearch "query"                    → Level 1: signal lines (one-liners)
+#   msearch "query" --detail           → Level 2: structured summaries (200-500 words)
+#   msearch "query" --full             → Level 3: full document chunks
+#
+# Filters:
+#   msearch "query" --kernel gemm      → filter by kernel type
+#   msearch "query" --stall math_throttle → filter by stall type
+#   msearch "query" --technique swizzle   → filter by technique
+#   msearch --fts "ldmatrix_x4"        → exact keyword match (PTX instructions)
+#
+# Requires: memory server running on localhost:8421
+# If it is down, this wrapper will try to start it automatically once.
+
+set -euo pipefail
+
+API="http://localhost:8421/api/search"
+MODE="hybrid"
+LEVEL=1
+K=10
+KERNEL=""
+STALL=""
+TECHNIQUE=""
+TYPE=""
+QUERY=""
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --detail)    LEVEL=2; shift ;;
+        --full)      LEVEL=3; K=3; shift ;;
+        --signals)   LEVEL=1; shift ;;
+        --fts)       MODE="fts"; LEVEL=0; shift ;;
+        --semantic)  MODE="semantic"; LEVEL=0; shift ;;
+        --kernel)    KERNEL="$2"; shift 2 ;;
+        --stall)     STALL="$2"; shift 2 ;;
+        --technique) TECHNIQUE="$2"; shift 2 ;;
+        --type)      TYPE="$2"; shift 2 ;;
+        -k)          K="$2"; shift 2 ;;
+        -h|--help)
+            echo "Usage: msearch [OPTIONS] \"query\""
+            echo ""
+            echo "Tiers (progressive disclosure):"
+            echo "  (default)        Level 1: signal lines — scan to find relevant docs"
+            echo "  --detail         Level 2: structured summaries (200-500 words)"
+            echo "  --full           Level 3: full document content"
+            echo ""
+            echo "Filters:"
+            echo "  --kernel TYPE    Filter by kernel (gemm, attention, lu, etc.)"
+            echo "  --stall TYPE     Filter by stall (math_throttle, long_scoreboard, etc.)"
+            echo "  --technique TAG  Filter by technique (swizzle, double_buffer, fp8, etc.)"
+            echo "  --type TYPE      Filter by doc type (source_code, playbook, etc.)"
+            echo "  --fts            Full-text search (exact keywords, good for PTX instructions)"
+            echo "  -k N             Number of results (default: 10 for signals, 3 for --full)"
+            exit 0
+            ;;
+        *)           QUERY="$QUERY $1"; shift ;;
+    esac
+done
+
+QUERY="${QUERY# }"  # trim leading space
+
+if [[ -z "$QUERY" ]]; then
+    echo "Usage: msearch \"your search query\"" >&2
+    echo "Run msearch --help for options." >&2
+    exit 1
+fi
+
+ensure_server() {
+    if curl -sf "http://localhost:8421/api/stats" > /dev/null 2>&1; then
+        return 0
+    fi
+    /data/src/bwk/common/memory/start-server.sh --daemon >/dev/null 2>&1 || true
+    sleep 2
+    curl -sf "http://localhost:8421/api/stats" > /dev/null 2>&1
+}
+
+run_query() {
+    local mode="$1"
+    local kernel="$2"
+    local stall="$3"
+    local technique="$4"
+
+    local url="${API}?q=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${QUERY}'))")&k=${K}&mode=${mode}&level=${LEVEL}"
+    [[ -n "$kernel" ]]    && url="${url}&kernel=${kernel}"
+    [[ -n "$stall" ]]     && url="${url}&stall=${stall}"
+    [[ -n "$technique" ]] && url="${url}&technique=${technique}"
+    [[ -n "$TYPE" ]]      && url="${url}&type=${TYPE}"
+
+    curl -sf "$url"
+}
+
+result_count() {
+    python3 -c "import json,sys; print(len(json.load(sys.stdin).get('results', [])))"
+}
+
+format_output() {
+    python3 -c "
+import json, sys
+
+LEVEL = ${LEVEL}
+data = json.load(sys.stdin)
+results = data.get('results', [])
+if not results:
+    print('No results found.')
+    sys.exit(0)
+
+print(f'{len(results)} results for: {data[\"query\"]}')
+print()
+
+for i, r in enumerate(results, 1):
+    prov = r.get('provenance', '')
+    badge = {'validated': '[V]', 'reference': '[R]', 'archive': '[A]'}.get(prov, '')
+    emp = ' [empirical]' if r.get('is_empirical') else ''
+    techs = r.get('techniques', '')
+
+    if LEVEL == 1:
+        signal = r.get('signal', r.get('title', ''))
+        print(f'[{i}] {badge} {signal}{emp}')
+        if techs:
+            print(f'    techniques: {techs}')
+
+    elif LEVEL == 2:
+        print(f'[{i}] {badge} {r[\"title\"]} ({r[\"kernel_type\"]}/{r[\"doc_type\"]}){emp}')
+        print(f'    File: {r[\"source_file\"]}')
+        summary = r.get('summary', '')
+        if summary:
+            for line in summary.split(chr(10)):
+                print(f'    {line}')
+        else:
+            print(f'    (no summary yet — run generate_summaries.py)')
+        print()
+
+    elif LEVEL >= 3:
+        print(f'[{i}] {badge} {r[\"title\"]} ({r[\"kernel_type\"]}/{r[\"doc_type\"]}){emp}')
+        print(f'    File: {r[\"source_file\"]}')
+        summary = r.get('summary', '')
+        if summary:
+            print(f'    --- Summary ---')
+            for line in summary.split(chr(10)):
+                print(f'    {line}')
+        chunks = r.get('chunks', [])
+        if chunks:
+            print(f'    --- Full Content ({len(chunks)} chunks) ---')
+            for chunk in chunks:
+                heading = chunk.get('heading', '')
+                if heading:
+                    print(f'    @ {heading}')
+                print(f'    {chunk[\"text\"]}')
+                print()
+        print()
+
+    else:
+        print(f'[{i}] {badge} {r[\"title\"]} ({r[\"kernel_type\"]}/{r[\"doc_type\"]}){emp}')
+        print(f'    File: {r[\"source_file\"]}')
+        if r.get('heading'):
+            print(f'    Section: {r[\"heading\"]}')
+        tags = []
+        if r.get('stall_types'):
+            tags.append(f'stalls: {r[\"stall_types\"]}')
+        if techs:
+            tags.append(f'techniques: {techs}')
+        if tags:
+            print(f'    {\" | \".join(tags)}')
+        text = r.get('text', '')
+        snippet = text[:400].replace(chr(10), ' ')
+        if len(text) > 400:
+            snippet += '...'
+        print(f'    {snippet}')
+        print()
+"
+}
+
+# Check server is running
+if ! ensure_server; then
+    echo "ERROR: Memory server not running on port 8421." >&2
+    echo "Tried: /data/src/bwk/common/memory/start-server.sh --daemon" >&2
+    exit 1
+fi
+
+RAW="$(run_query "$MODE" "$KERNEL" "$STALL" "$TECHNIQUE")"
+COUNT="$(printf '%s' "$RAW" | result_count)"
+
+if [[ "$COUNT" == "0" && "$MODE" != "fts" && ( -n "$KERNEL" || -n "$STALL" || -n "$TECHNIQUE" ) ]]; then
+    echo "[msearch] no filtered results; retrying broader search without kernel/stall/technique filters" >&2
+    RAW="$(run_query "$MODE" "" "" "")"
+    COUNT="$(printf '%s' "$RAW" | result_count)"
+fi
+
+if [[ "$COUNT" == "0" && "$MODE" != "fts" ]]; then
+    echo "[msearch] no semantic/hybrid results; retrying exact-text search" >&2
+    RAW="$(run_query "fts" "" "" "")"
+fi
+
+printf '%s' "$RAW" | format_output

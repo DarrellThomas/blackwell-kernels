@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blackwell_kernels"
+version = "0.1.0"
+description = "Custom CUDA kernels optimized for RTX 5090 (sm_120)"
+requires-python = ">=3.10"
+dependencies = ["torch"]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: uses the real embedding model and CLI smoke paths",
+]

@@ -1,0 +1,4 @@
+# ninja log v7
+1	52759	1774669187054342647	/data/src/bwk/ops/bench_primitives/build/temp.linux-x86_64-cpython-312/data/src/bwk/common/csrc/primitives/linalg/trmm_f32_sm120.o	ffc2e7d2123cda3d
+1	54165	1774669187054342647	/data/src/bwk/ops/bench_primitives/build/temp.linux-x86_64-cpython-312/csrc/bindings.o	300abf6163c523ed
+1	54642	1774669187054342647	/data/src/bwk/ops/bench_primitives/build/temp.linux-x86_64-cpython-312/data/src/bwk/common/csrc/primitives/linalg/syrk_f32_sm120.o	e7caddf5b475df57

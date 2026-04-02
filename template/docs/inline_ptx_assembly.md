@@ -1,0 +1,1 @@
+../../common/docs/inline_ptx_assembly.md

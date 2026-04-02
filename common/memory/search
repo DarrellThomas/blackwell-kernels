@@ -1,0 +1,6 @@
+#!/bin/bash
+# Quick search wrapper — suppresses model loading noise
+# Usage: ./search "bank conflict swizzle" --kernel gemm -k 5
+export TRANSFORMERS_NO_TF=1
+export TF_CPP_MIN_LOG_LEVEL=3
+exec python3 "$(dirname "$0")/factory_brain.py" search "$@" 2>/dev/null
