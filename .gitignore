@@ -25,7 +25,11 @@ for_darrell/
 
 # ── Factory database (live, not versioned) ────────────────────────────────────
 common/memory/research.db
+common/memory/research.db-shm
+common/memory/research.db-wal
+common/memory/.server.pid
 common/memory/*.bak
+common/memory/*.bak[0-9]*
 common/memory/*.step
 common/memory/*.backup*
 common/memory/factory_brain.backup*.py
@@ -45,8 +49,15 @@ common/csrc/primitives/lib/
 # ── Research cache (large PDFs and downloads) ─────────────────────────────────
 foreman-staff/researcher/cache/
 
+# ── Build artifacts ───────────────────────────────────────────────────────────
+**/build/temp*/
+**/build/lib*/
+**/dist/
+**/*.egg-info/
+
 # ── Misc ──────────────────────────────────────────────────────────────────────
 *.bak
+*.bak[0-9]*
 *~
 .DS_Store
 

@@ -33,48 +33,15 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# Allow direct script execution without requiring PYTHONPATH to be preset.
-if __package__ in (None, ""):
-    _REPO_ROOT = Path(__file__).resolve().parents[2]
-    if str(_REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(_REPO_ROOT))
-
 import sqlite_vec
-from common.memory import memory_config as _mem_cfg
-def validate_transition(from_state: str, to_state: str) -> tuple:
-    if from_state == to_state:
-        return False, f"Already in state '{from_state}'"
-    if from_state not in STATE_TO_PHASE:
-        return False, f"Unknown source state '{from_state}'"
-    if to_state not in STATE_TO_PHASE:
-        return False, f"Unknown target state '{to_state}'"
-    if from_state == 'shipped' and to_state not in ('converged', 'parked', 'abandoned'):
-        return False, (
-            "Cannot go backward from 'shipped'. Shipped work is versioned. "
-            "To make changes, create a new job (fb job-create)."
-        )
-    if from_state in ('converged', 'parked', 'abandoned'):
-        return True, ""
-    return True, ""
-
-
-from common.memory import memory_search as _mem_search
-from common.memory import memory_messages as _mem_messages
-from common.memory import memory_workers as _mem_workers
-from common.memory import memory_jobs as _mem_jobs
-from common.memory import memory_experiments as _mem_exps
-from common.memory import memory_stats as _mem_stats
-from common.memory import memory_issues as _mem_issues
-from common.memory import memory_ingest as _mem_ingest
-from common.memory.memory_helpers import format_result, format_quality_result, attach_helper_methods
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-DB_DIR = _mem_cfg.DB_DIR
-DB_PATH = _mem_cfg.DB_PATH
-BWK_ROOT = _mem_cfg.BWK_ROOT
+DB_DIR = Path(__file__).parent
+DB_PATH = DB_DIR / "research.db"
+BWK_ROOT = Path(__file__).resolve().parents[2]
 
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
 EMBEDDING_DIM = 768
@@ -89,14 +56,63 @@ CHUNK_OVERLAP_CHARS = 200
 # multiple directories, only the highest-priority copy is indexed.
 # ---------------------------------------------------------------------------
 
-SOURCE_PRIORITY = _mem_cfg.SOURCE_PRIORITY
-CODE_SOURCES = _mem_cfg.CODE_SOURCES
+SOURCE_PRIORITY = [
+    # Tier 1 — Validated (approved by foreman, backed by experiments)
+    (BWK_ROOT / "foreman-staff/researcher/approved", "research", "validated", 10),
+    (BWK_ROOT / "common/docs", "reference", "reference", 12),
+    (BWK_ROOT / "common/claude", "reference", "reference", 13),
+    # Tier 2 — Research (active briefs, curated cache)
+    (BWK_ROOT / "foreman-staff/researcher/archive", "research", "research", 20),
+    (BWK_ROOT / "foreman-staff/researcher/cache", "research", "research", 25),
+    (BWK_ROOT / "foreman-staff/researcher/inbox", "research", "research", 30),
+    # Tier 3 — Worker docs (may have local copies of shared docs)
+    (BWK_ROOT / "main/docs", "research", "research", 40),
+    (BWK_ROOT / "gemm/docs", "research", "research", 40),
+    (BWK_ROOT / "fused-mlp/docs", "research", "research", 40),
+    (BWK_ROOT / "attention/docs", "research", "research", 40),
+    (BWK_ROOT / "dotproduct/docs", "research", "research", 40),
+    (BWK_ROOT / "linalg/docs", "research", "research", 40),
+    (BWK_ROOT / "lu/docs", "research", "research", 40),
+    (BWK_ROOT / "qr/docs", "research", "research", 40),
+    (BWK_ROOT / "rmsnorm/docs", "research", "research", 40),
+    (BWK_ROOT / "spmv/docs", "research", "research", 40),
+    (BWK_ROOT / "numerical/docs", "research", "research", 40),
+    (BWK_ROOT / "cuquantum/docs", "research", "research", 40),
+    (BWK_ROOT / "chess-training/docs", "research", "research", 40),
+    (BWK_ROOT / "octave-gpu/docs", "research", "research", 40),
+    (BWK_ROOT / "ui/docs", "research", "research", 40),
+    # Tier 3b — Worker .claude/ dirs (hard-won lessons, specs, feedback)
+    (BWK_ROOT / "main/.claude", "agent_state", "validated", 45),
+    (BWK_ROOT / "gemm/.claude", "agent_state", "validated", 45),
+    (BWK_ROOT / "fused-mlp/.claude", "agent_state", "validated", 45),
+    (BWK_ROOT / "attention/.claude", "agent_state", "validated", 45),
+    (BWK_ROOT / "dotproduct/.claude", "agent_state", "validated", 45),
+    (BWK_ROOT / "linalg/.claude", "agent_state", "validated", 45),
+    (BWK_ROOT / "lu/.claude", "agent_state", "validated", 45),
+    (BWK_ROOT / "qr/.claude", "agent_state", "validated", 45),
+    (BWK_ROOT / "rmsnorm/.claude", "agent_state", "validated", 45),
+    (BWK_ROOT / "spmv/.claude", "agent_state", "validated", 45),
+    (BWK_ROOT / "numerical/.claude", "agent_state", "validated", 45),
+    (BWK_ROOT / "cuquantum/.claude", "agent_state", "validated", 45),
+    (BWK_ROOT / "chess-training/.claude", "agent_state", "validated", 45),
+    (BWK_ROOT / "octave-gpu/.claude", "agent_state", "validated", 45),
+    # Tier 4 — Archive (historical snapshots, may be stale)
+]
+
+# Source code: NOT indexed. Git is the authority for .cu/.cuh files.
+# Workers search code via grep/glob, not the vector DB.
+CODE_SOURCES = []
 
 # ---------------------------------------------------------------------------
 # Provenance tier definitions — used for search ranking
 # ---------------------------------------------------------------------------
 
-PROVENANCE_TIERS = _mem_cfg.PROVENANCE_TIERS
+PROVENANCE_TIERS = {
+    "validated": {"boost": 1.5, "description": "Foreman-approved, empirically backed"},
+    "reference": {"boost": 1.3, "description": "Shared reference docs, manuals"},
+    "research":  {"boost": 1.0, "description": "Active research briefs"},
+    "archive":   {"boost": 0.7, "description": "Historical snapshots, may be stale"},
+}
 
 # ---------------------------------------------------------------------------
 # Technique and stall vocabulary for semantic tagging
@@ -149,19 +165,93 @@ TECHNIQUE_PATTERNS = {
 # Job State Machine — Phase-Based
 # ---------------------------------------------------------------------------
 
-JOB_PHASES = _mem_cfg.JOB_PHASES
-PHASE_ORDER = _mem_cfg.PHASE_ORDER
-STATE_TO_PHASE = _mem_cfg.STATE_TO_PHASE
-ALL_JOB_STATES = _mem_cfg.ALL_JOB_STATES
+JOB_PHASES = {
+    'ideation':    ['wishlist', 'planning'],
+    'development': ['not_started', 'algo_building', 'algo_optimizing', 'hw_optimizing',
+                    'stuck_needs_research', 'research_available'],
+    'validation':  ['compiles_ok', 'tests_writing', 'testing', 'testing_pass', 'testing_fail',
+                    'edge_testing', 'edge_pass', 'edge_fail'],
+    'rework':      ['rework', 'rework_complete', 'retesting', 'retest_pass', 'retest_fail'],
+    'quality':     ['linting', 'lint_pass', 'lint_fail'],
+    'shipping':    ['ready_to_ship', 'shipping', 'shipped'],
+    'terminal':    ['converged', 'parked', 'abandoned'],
+}
 
-JOB_TYPES = _mem_cfg.JOB_TYPES
-JOB_PRIORITIES = _mem_cfg.JOB_PRIORITIES
-MESSAGE_TYPES = _mem_cfg.MESSAGE_TYPES
-MESSAGE_STATUSES = _mem_cfg.MESSAGE_STATUSES
-MESSAGE_PRIORITIES = _mem_cfg.MESSAGE_PRIORITIES
-FACTORY_MODES = _mem_cfg.FACTORY_MODES
-OPTIMIZATION_SCOPES = _mem_cfg.OPTIMIZATION_SCOPES
-EXECUTION_LANES = _mem_cfg.EXECUTION_LANES
+PHASE_ORDER = ['ideation', 'development', 'validation', 'rework', 'quality', 'shipping', 'terminal']
+
+STATE_TO_PHASE = {}
+for _phase, _states in JOB_PHASES.items():
+    for _state in _states:
+        STATE_TO_PHASE[_state] = _phase
+
+ALL_JOB_STATES = set(STATE_TO_PHASE.keys())
+
+JOB_TYPES = {'kernel', 'algorithm', 'infrastructure', 'research'}
+JOB_PRIORITIES = {'1', '2', '3', '4', '5'}
+FACTORY_MODES = {
+    'fixed_shape_kernel',
+    'general_shape_library',
+    'numerical_method',
+    'alternative_arithmetic',
+    'research_exploration',
+}
+OPTIMIZATION_SCOPES = {
+    'algorithmic',
+    'hardware_tuned',
+    'hybrid',
+}
+EXECUTION_LANES = {'active', 'hopper', 'incubating', 'parked'}
+MESSAGE_TYPES = {'halt', 'blocker', 'question', 'feedback', 'info', 'directive'}
+MESSAGE_STATUSES = {'open', 'acknowledged', 'resolved'}
+MESSAGE_PRIORITIES = {'urgent', 'normal', 'low'}
+
+
+def _phase_index(phase: str) -> int:
+    return PHASE_ORDER.index(phase)
+
+
+def validate_transition(from_state: str, to_state: str) -> tuple:
+    """Check if a state transition is legal. Returns (is_valid, error_message).
+
+    Rules:
+      - Before 'shipped': move freely in any direction. Development is iterative.
+      - 'shipped' is the hard line. Versioned. Once shipped, only → terminal.
+      - Terminal states can reactivate back to development.
+      - 'shipped' cannot go backward. To change shipped work, create a new job.
+    """
+    if from_state == to_state:
+        return False, f"Already in state '{from_state}'"
+    if from_state not in STATE_TO_PHASE:
+        return False, f"Unknown source state '{from_state}'"
+    if to_state not in STATE_TO_PHASE:
+        return False, f"Unknown target state '{to_state}'"
+
+    # Shipped can go to terminal OR back to development/validation for rework.
+    # Going backward from shipped triggers a version bump (handled by update_job).
+    if from_state == 'shipped':
+        to_phase = STATE_TO_PHASE.get(to_state, '')
+        if to_phase not in ('development', 'validation', 'rework', 'terminal'):
+            return False, (
+                f"From 'shipped', can go to development/validation/rework (version bump) "
+                f"or terminal. Cannot go to '{to_state}' ({to_phase})."
+            )
+
+    # Terminal can reactivate to development
+    if from_state in ('converged', 'parked', 'abandoned'):
+        return True, ""
+
+    # Everything before shipped: move freely
+    return True, ""
+
+
+# Kernel type inference from filename prefixes
+KERNEL_PREFIXES = [
+    "attention", "gemm", "fused_mlp", "fusedmlp", "lu", "qr", "cholesky",
+    "spmv", "dotproduct", "linalg", "rmsnorm", "swiglu", "fft", "trsm",
+    "cg", "gmres", "eigenvalue", "convolution", "ichol", "ldlt", "bicgstab",
+    "numerical", "cross", "all",
+]
+
 
 # ---------------------------------------------------------------------------
 # Embedding Model (lazy-loaded singleton)
@@ -417,11 +507,10 @@ def chunk_code(text: str, source_file: str, max_chars: int = 2000,
 
 def infer_kernel_type(filepath: str, text: str = "") -> str:
     """Infer kernel type from filename, path, or content."""
-    kernel_prefixes = _mem_ingest.KERNEL_PREFIXES
     name = os.path.basename(filepath).lower()
     path_parts = filepath.lower()
 
-    for prefix in kernel_prefixes:
+    for prefix in KERNEL_PREFIXES:
         if name.startswith(prefix + "_") or name.startswith(prefix + "-"):
             return prefix
         # Match directory component exactly (not substring)
@@ -431,7 +520,7 @@ def infer_kernel_type(filepath: str, text: str = "") -> str:
     # Content-based fallback for files that don't follow naming conventions
     if text:
         text_lower = text[:2000].lower()
-        for prefix in kernel_prefixes:
+        for prefix in KERNEL_PREFIXES:
             if prefix == "all" or prefix == "cross":
                 continue  # too generic for content matching
             # Require the kernel name to appear as a word
@@ -549,8 +638,6 @@ class ResearchMemory:
     def __init__(self, db_path: str | Path = DB_PATH):
         self.db_path = str(db_path)
         self.conn = sqlite3.connect(self.db_path)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute("PRAGMA busy_timeout = 5000;")
         self.conn.enable_load_extension(True)
         sqlite_vec.load(self.conn)
         self.conn.enable_load_extension(False)
@@ -722,6 +809,7 @@ class ResearchMemory:
         c.execute("CREATE INDEX IF NOT EXISTS idx_experiments_time ON experiments(timestamp)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_experiments_status ON experiments(status)")
 
+        # -- Test runs log for compliance and gate steps --
         c.execute("""
             CREATE TABLE IF NOT EXISTS test_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -736,6 +824,7 @@ class ResearchMemory:
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_test_runs_job ON test_runs(job_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_test_runs_kernel ON test_runs(kernel_type)")
+
 
         # -- Issues table (tester → foreman → worker → tester cycle) --
         c.execute("""
@@ -813,13 +902,15 @@ class ResearchMemory:
                 reference_label TEXT DEFAULT ''
             )
         """)
-        for col in ['spec', 'source_file', 'version', 'factory_mode', 'execution_lane',
-                    'objective_vector', 'acceptance_gates', 'keep_rule', 'benchmark_set',
-                    'failure_budget', 'crossover_policy', 'optimization_scope',
-                    'hardware_target', 'retarget_policy', 'reference_label']:
+        for col in ['spec', 'source_file', 'version', 'factory_mode',
+                    'execution_lane',
+                    'objective_vector', 'acceptance_gates', 'keep_rule',
+                    'benchmark_set', 'failure_budget', 'crossover_policy',
+                    'optimization_scope', 'hardware_target', 'retarget_policy',
+                    'reference_label']:
             try:
                 if col == 'version':
-                    c.execute("ALTER TABLE jobs ADD COLUMN version REAL DEFAULT 0")
+                    c.execute(f"ALTER TABLE jobs ADD COLUMN version REAL DEFAULT 0")
                 else:
                     c.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT DEFAULT ''")
             except sqlite3.OperationalError:
@@ -1165,6 +1256,13 @@ class ResearchMemory:
 
         return results
 
+    def record_test_run(self, job_id: int, kernel_type: str, category: str, command: str, status: str, output: str = "") -> None:
+        """Persist a gate/test run for compliance, edge, and stress suites."""
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.conn.execute("INSERT INTO test_runs (job_id, kernel_type, category, command, status, output, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                          (job_id if job_id is not None else None, kernel_type, category, command, status, output, now))
+        self.conn.commit()
+
     # -- Issues --
 
     def file_issue(self, title: str, severity: str, kernel_type: str,
@@ -1255,21 +1353,38 @@ class ResearchMemory:
 
     def create_job(self, name, title, description="", job_type="kernel", kernel_type="",
                    parent_job_id=None, state="wishlist", priority="3", assigned_to="",
-                   target_vs_ref=1.0, tags="", created_by="ops", notes="",
-                   source_file="") -> int:
+                   execution_lane="", target_vs_ref=1.0, tags="", created_by="ops", notes="",
+                   source_file="", factory_mode="", objective_vector="",
+                   acceptance_gates="", keep_rule="", benchmark_set="",
+                   failure_budget="", crossover_policy="", optimization_scope="",
+                   hardware_target="", retarget_policy="", reference_label="") -> int:
         if state not in ALL_JOB_STATES:
             raise ValueError(f"Unknown state '{state}'. Valid: {sorted(ALL_JOB_STATES)}")
+        if factory_mode and factory_mode not in FACTORY_MODES:
+            raise ValueError(f"Unknown factory mode '{factory_mode}'. Valid: {sorted(FACTORY_MODES)}")
+        if optimization_scope and optimization_scope not in OPTIMIZATION_SCOPES:
+            raise ValueError(
+                f"Unknown optimization scope '{optimization_scope}'. "
+                f"Valid: {sorted(OPTIMIZATION_SCOPES)}"
+            )
         phase = STATE_TO_PHASE[state]
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         cursor = self.conn.execute("""
             INSERT INTO jobs (name, title, description, job_type, kernel_type,
-                              parent_job_id, state, phase, priority, assigned_to,
+                              parent_job_id, state, phase, priority, assigned_to, execution_lane,
                               target_vs_ref, tags, created_at, updated_at,
-                              created_by, updated_by, notes, source_file)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              created_by, updated_by, notes, source_file,
+                              factory_mode, objective_vector, acceptance_gates,
+                              keep_rule, benchmark_set, failure_budget,
+                              crossover_policy, optimization_scope,
+                              hardware_target, retarget_policy, reference_label)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (name, title, description, job_type, kernel_type,
-              parent_job_id, state, phase, priority, assigned_to,
-              target_vs_ref, tags, now, now, created_by, created_by, notes, source_file))
+              parent_job_id, state, phase, priority, assigned_to, execution_lane,
+              target_vs_ref, tags, now, now, created_by, created_by, notes, source_file,
+              factory_mode, objective_vector, acceptance_gates, keep_rule,
+              benchmark_set, failure_budget, crossover_policy, optimization_scope,
+              hardware_target, retarget_policy, reference_label))
         job_id = cursor.lastrowid
         self.conn.execute("""
             INSERT INTO job_transitions (job_id, from_state, to_state, changed_by, reason, timestamp)
@@ -1288,21 +1403,64 @@ class ResearchMemory:
             raise ValueError(err)
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         new_phase = STATE_TO_PHASE[to_state]
-        self.conn.execute("UPDATE jobs SET state = ?, phase = ?, updated_at = ?, updated_by = ? WHERE id = ?",
-                          (to_state, new_phase, now, changed_by, job_id))
+
+        # Version bump: every time a job hits 'shipped' internally, minor version increments.
+        # Internal versions are 0.x (0.1, 0.2, ...). Public release will be 1.0.
+        lane_update = ""
+        lane_params = []
+        if to_state in ('shipped', 'converged', 'abandoned', 'parked'):
+            lane_update = ", execution_lane = ?"
+            lane_params = ['parked']
+        if to_state == 'shipped':
+            cur = job.get("version", 0) or 0
+            version = round(cur + 0.1, 1)
+            reason = f"[v{version}] {reason}" if reason else f"[v{version}] shipped"
+            self.conn.execute(
+                f"UPDATE jobs SET state = ?, phase = ?, version = ?, updated_at = ?, updated_by = ?{lane_update} WHERE id = ?",
+                (to_state, new_phase, version, now, changed_by, *lane_params, job_id))
+        else:
+            self.conn.execute(
+                f"UPDATE jobs SET state = ?, phase = ?, updated_at = ?, updated_by = ?{lane_update} WHERE id = ?",
+                (to_state, new_phase, now, changed_by, *lane_params, job_id))
         self.conn.execute("""
             INSERT INTO job_transitions (job_id, from_state, to_state, changed_by, reason, timestamp)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (job_id, from_state, to_state, changed_by, reason, now))
         self.conn.commit()
+
+        if to_state == 'rework':
+            kernel = job.get('kernel_type') or '<kernel>'
+            query = f"{BWK_ROOT}/common/memory/msearch \"{kernel} failure root cause\" --kernel {kernel} -k 5" if kernel != '<kernel>' else "{BWK_ROOT}/common/memory/msearch \"failure root cause\" -k 5"
+            self.ensure_open_message('watchdog',
+                                     f"Research checkpoint required for job #{job_id}",
+                                     body=(
+                                         "Job entered rework. Before continuing, read the failure messages, run a research checkpoint against the DB, and use the result to guide the next fix. Suggested query: " + query
+                                     ),
+                                     job_id=job_id, message_type='info', priority='normal')
+
         return self.get_job(job_id)
 
     def update_job(self, job_id, updated_by="ops", **kwargs):
-        allowed = {"title", "description", "priority", "assigned_to", "vs_ref",
-                    "target_vs_ref", "tags", "notes", "kernel_type", "spec", "source_file"}
+        allowed = {"title", "description", "priority", "assigned_to", "execution_lane", "vs_ref",
+                    "target_vs_ref", "tags", "notes", "kernel_type", "spec",
+                    "source_file", "factory_mode", "objective_vector",
+                    "acceptance_gates", "keep_rule", "benchmark_set",
+                    "failure_budget", "crossover_policy", "optimization_scope",
+                    "hardware_target", "retarget_policy", "reference_label"}
         updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
         if not updates:
             return self.get_job(job_id)
+        if "factory_mode" in updates and updates["factory_mode"] and updates["factory_mode"] not in FACTORY_MODES:
+            raise ValueError(f"Unknown factory mode '{updates['factory_mode']}'. Valid: {sorted(FACTORY_MODES)}")
+        if "optimization_scope" in updates and updates["optimization_scope"] and updates["optimization_scope"] not in OPTIMIZATION_SCOPES:
+            raise ValueError(
+                f"Unknown optimization scope '{updates['optimization_scope']}'. "
+                f"Valid: {sorted(OPTIMIZATION_SCOPES)}"
+            )
+        if "execution_lane" in updates and updates["execution_lane"] and updates["execution_lane"] not in EXECUTION_LANES:
+            raise ValueError(
+                f"Unknown execution lane '{updates['execution_lane']}'. Valid: {sorted(EXECUTION_LANES)}"
+            )
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         updates["updated_at"] = now
         updates["updated_by"] = updated_by
@@ -1321,7 +1479,7 @@ class ResearchMemory:
         return dict(row) if row else None
 
     def get_jobs(self, state=None, phase=None, job_type=None, kernel_type=None,
-                 assigned_to=None, parent_job_id=None, priority=None):
+                 assigned_to=None, parent_job_id=None, priority=None, execution_lane=None):
         where, params = [], []
         if state:
             where.append("state = ?"); params.append(state)
@@ -1333,6 +1491,8 @@ class ResearchMemory:
             where.append("kernel_type = ?"); params.append(kernel_type)
         if assigned_to:
             where.append("assigned_to = ?"); params.append(assigned_to)
+        if execution_lane:
+            where.append("execution_lane = ?"); params.append(execution_lane)
         if parent_job_id is not None:
             where.append("parent_job_id = ?"); params.append(parent_job_id)
         if priority:
@@ -1340,7 +1500,8 @@ class ResearchMemory:
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         rows = self.conn.execute(f"""
             SELECT * FROM jobs {where_sql}
-            ORDER BY CAST(priority AS INTEGER), updated_at DESC
+            ORDER BY CASE execution_lane WHEN 'active' THEN 0 WHEN 'hopper' THEN 1 WHEN 'incubating' THEN 2 WHEN 'parked' THEN 3 ELSE 4 END,
+                     CAST(priority AS INTEGER), updated_at DESC
         """, params).fetchall()
         return [dict(r) for r in rows]
 
@@ -1349,6 +1510,36 @@ class ResearchMemory:
             "SELECT * FROM job_transitions WHERE job_id = ? ORDER BY timestamp ASC",
             (job_id,)).fetchall()
         return [dict(r) for r in rows]
+
+    def get_watchdog_state(self, name: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM watchdog_state WHERE name = ?",
+            (name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def touch_watchdog_state(self, name: str, status: str = "", notes: str = "") -> dict:
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.conn.execute("""
+            INSERT INTO watchdog_state (name, last_run_at, last_status, notes)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                last_run_at=excluded.last_run_at,
+                last_status=excluded.last_status,
+                notes=excluded.notes
+        """, (name, now, status, notes))
+        self.conn.commit()
+        return self.get_watchdog_state(name)
+
+    def set_watchdog_daemon_state(self, status: str, notes: str = "", pid: int | None = None, host: str = "") -> dict:
+        parts = []
+        if pid is not None:
+            parts.append(f"pid={pid}")
+        if host:
+            parts.append(f"host={host}")
+        if notes:
+            parts.append(notes)
+        return self.touch_watchdog_state("watchdog_daemon", status=status, notes=" | ".join(parts))
 
     def sync_job_vsref(self, job_id):
         job = self.get_job(job_id)
@@ -1376,6 +1567,21 @@ class ResearchMemory:
         """, (job_id, from_agent, to_agent, message_type, subject, body, priority, now))
         self.conn.commit()
         return cursor.lastrowid
+
+    def ensure_open_message(self, from_agent, subject, body="", to_agent="",
+                            job_id=None, message_type="info", priority="normal"):
+        row = self.conn.execute("""
+            SELECT id FROM messages
+            WHERE status = 'open' AND from_agent = ? AND subject = ?
+              AND COALESCE(job_id, -1) = COALESCE(?, -1)
+            ORDER BY id DESC
+            LIMIT 1
+        """, (from_agent, subject, job_id)).fetchone()
+        if row:
+            return row[0]
+        return self.create_message(from_agent=from_agent, subject=subject, body=body,
+                                   to_agent=to_agent, job_id=job_id,
+                                   message_type=message_type, priority=priority)
 
     def acknowledge_message(self, message_id, by="foreman"):
         self.conn.execute("UPDATE messages SET status = 'acknowledged' WHERE id = ?", (message_id,))
@@ -1416,6 +1622,168 @@ class ResearchMemory:
                 created_at DESC
         """, params).fetchall()
         return [dict(r) for r in rows]
+
+    # -- Experiments --
+
+    def record_experiment(self, kernel_type: str, status: str, description: str,
+                          timestamp: str = "", git_commit: str = "", duration_us=None,
+                          vs_ref=None, sm_pct=None, stall_math=None, stall_wait=None,
+                          stall_scoreboard=None, stall_barrier=None, top_stall: str = "",
+                          job_id: int = None, source_type: str = "db",
+                          source_path: str = "", experiment_index: int = 0,
+                          reference_label: str = "", extra: dict | None = None) -> dict:
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        payload = {
+            "kernel_type": kernel_type,
+            "job_id": job_id,
+            "source_type": source_type,
+            "source_path": source_path,
+            "experiment_index": experiment_index,
+            "timestamp": (timestamp or "").strip() or now,
+            "git_commit": git_commit or "",
+            "duration_us": duration_us,
+            "vs_ref": vs_ref,
+            "sm_pct": sm_pct,
+            "stall_math": stall_math,
+            "stall_wait": stall_wait,
+            "stall_scoreboard": stall_scoreboard,
+            "stall_barrier": stall_barrier,
+            "top_stall": top_stall or "",
+            "status": (status or "").strip().lower(),
+            "description": description or "",
+            "reference_label": reference_label or "",
+            "extra_json": json.dumps(extra or {}, sort_keys=True),
+        }
+        row_hash = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        self.conn.execute("""
+            INSERT OR IGNORE INTO experiments (
+                kernel_type, job_id, source_type, source_path, row_hash,
+                experiment_index, timestamp, git_commit, duration_us, vs_ref, sm_pct,
+                stall_math, stall_wait, stall_scoreboard, stall_barrier,
+                top_stall, status, description, reference_label, extra_json,
+                recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            payload["kernel_type"], payload["job_id"], payload["source_type"],
+            payload["source_path"], row_hash, payload["experiment_index"],
+            payload["timestamp"], payload["git_commit"], payload["duration_us"],
+            payload["vs_ref"], payload["sm_pct"], payload["stall_math"],
+            payload["stall_wait"], payload["stall_scoreboard"],
+            payload["stall_barrier"], payload["top_stall"], payload["status"],
+            payload["description"], payload["reference_label"],
+            payload["extra_json"], now
+        ))
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT * FROM experiments WHERE row_hash = ?",
+            (row_hash,)
+        ).fetchone()
+        return dict(row) if row else {}
+
+    def get_experiments(self, kernel_type: str = None, job_id: int = None,
+                        limit: int = 100, status: str = None):
+        where, params = [], []
+        if kernel_type:
+            where.append("kernel_type = ?"); params.append(kernel_type)
+        if job_id is not None:
+            where.append("job_id = ?"); params.append(job_id)
+        if status:
+            where.append("status = ?"); params.append(status)
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        rows = self.conn.execute(f"""
+            SELECT * FROM experiments {where_sql}
+            ORDER BY COALESCE(timestamp, recorded_at) DESC, id DESC
+            LIMIT ?
+        """, params + [limit]).fetchall()
+        return [dict(r) for r in rows]
+
+    def summarize_experiments(self, kernel_type: str = None, job_id: int = None,
+                              recent: int = 12) -> dict:
+        rows = self.get_experiments(kernel_type=kernel_type, job_id=job_id, limit=10000)
+        summary = {
+            "kernel_type": kernel_type or "",
+            "job_id": job_id,
+            "total": len(rows),
+            "kept": 0,
+            "discarded": 0,
+            "unknown": 0,
+            "current_discard_streak": 0,
+            "max_discard_streak": 0,
+            "best_keep": None,
+            "last_keep": None,
+            "last_experiment": rows[0] if rows else None,
+            "recent": rows[:recent],
+            "top_stalls": [],
+            "recent_discards": [],
+            "recent_keeps": [],
+        }
+        if not rows:
+            return summary
+
+        ordered = list(reversed(rows))
+        stall_counts = {}
+        current_discard_streak = 0
+        max_discard_streak = 0
+        running_discard_streak = 0
+        best_keep = None
+        last_keep = None
+
+        for row in ordered:
+            row_status = (row.get("status") or "").strip().lower()
+            if row_status in ("keep", "kept"):
+                summary["kept"] += 1
+                last_keep = row
+                running_discard_streak = 0
+                vr = row.get("vs_ref")
+                dur = row.get("duration_us")
+                if best_keep is None:
+                    best_keep = row
+                else:
+                    best_vr = best_keep.get("vs_ref")
+                    best_dur = best_keep.get("duration_us")
+                    if vr is not None and (best_vr is None or vr > best_vr):
+                        best_keep = row
+                    elif vr is not None and best_vr is not None and abs(vr - best_vr) < 1e-12:
+                        if dur is not None and (best_dur is None or dur < best_dur):
+                            best_keep = row
+            elif row_status in ("discard", "discarded"):
+                summary["discarded"] += 1
+                running_discard_streak += 1
+                max_discard_streak = max(max_discard_streak, running_discard_streak)
+            else:
+                summary["unknown"] += 1
+                running_discard_streak = 0
+
+            top_stall = (row.get("top_stall") or "").strip()
+            if top_stall and top_stall not in ("-", "none"):
+                stall_counts[top_stall] = stall_counts.get(top_stall, 0) + 1
+
+        for row in rows:
+            row_status = (row.get("status") or "").strip().lower()
+            if row_status in ("discard", "discarded"):
+                current_discard_streak += 1
+            else:
+                break
+
+        summary["current_discard_streak"] = current_discard_streak
+        summary["max_discard_streak"] = max_discard_streak
+        summary["best_keep"] = best_keep
+        summary["last_keep"] = last_keep
+        summary["top_stalls"] = [
+            {"stall": stall, "count": count}
+            for stall, count in sorted(stall_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+        ]
+        summary["recent_discards"] = [
+            r for r in rows
+            if (r.get("status") or "").strip().lower() in ("discard", "discarded")
+        ][:5]
+        summary["recent_keeps"] = [
+            r for r in rows
+            if (r.get("status") or "").strip().lower() in ("keep", "kept")
+        ][:5]
+        return summary
 
     # -- Ingest --
 
@@ -1572,7 +1940,7 @@ class ResearchMemory:
         real_doc_type = infer_doc_type(filepath, doc_type)
         provenance = infer_provenance(filepath, real_doc_type)
         # Use path-based hint if provenance detection gives generic result
-        if provenance == "research" and prov_hint and prov_hint != "research":
+        if provenance == "research" and prov_hint in ("validated", "reference"):
             provenance = prov_hint
         title = self._extract_title(content, filepath)
         is_empirical = detect_empirical(content)
@@ -1614,6 +1982,8 @@ class ResearchMemory:
             "SELECT id FROM documents WHERE source_file = ?", (filepath,)
         ).fetchone()["id"]
 
+        # If content changed, invalidate Level 2 artifacts so stale summaries do
+        # not survive a re-ingest. They will be regenerated by generate_summaries.py.
         if content_changed:
             self.conn.execute(
                 "UPDATE documents SET summary = '', signal = '', has_summary = 0 WHERE id = ?",
@@ -1684,15 +2054,12 @@ class ResearchMemory:
         # Use TSV filename as doc identity
         content_hash = file_content_hash(Path(tsv_path).read_text(errors="replace"))
 
-        # Check if already indexed with same hash
+        # Check if document chunks are already indexed with same hash
         existing = self.conn.execute(
             "SELECT id, content_hash, chunk_count FROM documents WHERE source_file = ?",
             (tsv_path,)
         ).fetchone()
-        content_changed = bool(existing and existing["content_hash"] != content_hash)
-
-        if existing and existing["content_hash"] == content_hash and not force:
-            return {"files": 0, "chunks": 0, "skipped": 1}
+        doc_up_to_date = bool(existing and existing["content_hash"] == content_hash and not force)
 
         # Parse TSV
         with open(tsv_path, "r") as f:
@@ -1722,15 +2089,10 @@ class ResearchMemory:
         raw_chunks = []
         kept_count = 0
         discarded_count = 0
-
-        def _to_float(value):
-            text = str(value or "").strip()
-            if not text or text == "-":
-                return None
-            try:
-                return float(text)
-            except ValueError:
-                return None
+        try:
+            self.conn.execute("DELETE FROM experiments WHERE source_type = 'tsv' AND source_path = ?", (tsv_path,))
+        except sqlite3.OperationalError:
+            pass
 
         for i, row in enumerate(rows):
             desc = row.get(desc_col, "").strip()
@@ -1781,6 +2143,43 @@ class ResearchMemory:
             else:
                 discarded_count += 1
 
+            def _to_float(value):
+                text = str(value or "").strip()
+                if not text or text == "-":
+                    return None
+                try:
+                    return float(text)
+                except ValueError:
+                    return None
+
+            extras = {
+                k: v for k, v in row.items()
+                if k not in {
+                    "timestamp", "commit", "duration_us", "vs_ref", "sm_pct",
+                    "stall_math", "stall_wait", "stall_scoreboard",
+                    "stall_barrier", "top_stall", "status", "description",
+                }
+            }
+            self.record_experiment(
+                kernel_type=kernel_type,
+                status=status or "unknown",
+                description=desc,
+                timestamp=timestamp,
+                git_commit=commit,
+                duration_us=_to_float(duration),
+                vs_ref=_to_float(vs_ref),
+                sm_pct=_to_float(sm_pct),
+                stall_math=_to_float(row.get("stall_math")),
+                stall_wait=_to_float(row.get("stall_wait")),
+                stall_scoreboard=_to_float(row.get("stall_scoreboard")),
+                stall_barrier=_to_float(row.get("stall_barrier")),
+                top_stall=top_stall,
+                source_type="tsv",
+                source_path=tsv_path,
+                experiment_index=i + 1,
+                extra=extras,
+            )
+
             raw_chunks.append({
                 "text": chunk_text,
                 "heading": heading,
@@ -1788,32 +2187,15 @@ class ResearchMemory:
                 "stalls": stall_str,
                 "techniques": techs,
                 "status": status,
-                "timestamp": timestamp,
-                "git_commit": commit,
-                "duration_us": _to_float(duration),
-                "vs_ref": _to_float(vs_ref),
-                "sm_pct": _to_float(sm_pct),
-                "stall_math": _to_float(row.get("stall_math")),
-                "stall_wait": _to_float(row.get("stall_wait")),
-                "stall_scoreboard": _to_float(row.get("stall_scoreboard")),
-                "stall_barrier": _to_float(row.get("stall_barrier")),
-                "top_stall": top_stall if top_stall not in {"", "-", "none"} else "",
-                "extra": {
-                    key: value
-                    for key, value in row.items()
-                    if key not in {"timestamp", "commit", "duration_us", "vs_ref", "sm_pct",
-                                   "stall_math", "stall_wait", "stall_scoreboard",
-                                   "stall_barrier", "top_stall", "status", "description"}
-                },
             })
 
         if not raw_chunks:
             return {"files": 0, "chunks": 0, "skipped": 1}
 
-        self.conn.execute(
-            "DELETE FROM experiments WHERE source_type = 'tsv' AND source_path = ?",
-            (tsv_path,)
-        )
+        if doc_up_to_date:
+            self.conn.commit()
+            return {"files": 0, "chunks": 0, "skipped": 1,
+                    "kept": kept_count, "discarded": discarded_count}
 
         # Embed all chunks
         texts = [c["text"] for c in raw_chunks]
@@ -1849,13 +2231,6 @@ class ResearchMemory:
             "SELECT id FROM documents WHERE source_file = ?", (tsv_path,)
         ).fetchone()["id"]
 
-        if content_changed:
-            self.conn.execute(
-                "UPDATE documents SET summary = '', signal = '', has_summary = 0 WHERE id = ?",
-                (doc_id,)
-            )
-            self.conn.execute("DELETE FROM vec_summaries WHERE doc_id = ?", (doc_id,))
-
         # Delete old chunks
         old_chunk_ids = [r["id"] for r in self.conn.execute(
             "SELECT id FROM chunks WHERE doc_id = ?", (doc_id,)
@@ -1877,25 +2252,6 @@ class ResearchMemory:
             self.conn.execute(
                 "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
                 (chunk_id, serialize_f32(emb))
-            )
-            self.record_experiment(
-                kernel_type=kernel_type,
-                status=chunk["status"],
-                description=chunk["text"],
-                timestamp=chunk["timestamp"],
-                git_commit=chunk["git_commit"],
-                duration_us=chunk["duration_us"],
-                vs_ref=chunk["vs_ref"],
-                sm_pct=chunk["sm_pct"],
-                stall_math=chunk["stall_math"],
-                stall_wait=chunk["stall_wait"],
-                stall_scoreboard=chunk["stall_scoreboard"],
-                stall_barrier=chunk["stall_barrier"],
-                top_stall=chunk["top_stall"],
-                source_type="tsv",
-                source_path=tsv_path,
-                experiment_index=chunk["position"] + 1,
-                extra=chunk["extra"],
             )
 
         self.conn.commit()
@@ -1945,66 +2301,73 @@ class ResearchMemory:
 
         Workers self-report: heartbeat (alive), current_task, process_state (working/complete).
         The system computes: stuck (from discard streaks), idle (from stale heartbeat).
+        If a job id is supplied and that job has a kernel_type, the job-owned kernel identity
+        wins over the caller-provided label. This keeps project/job heartbeats from being
+        accidentally attributed to the wrong worker family.
         """
+        canonical_kernel = (kernel_type or "").strip()
+        if job_id is not None:
+            job = self.get_job(job_id)
+            job_worker = ((job or {}).get("assigned_to") or "").strip()
+            job_kernel = ((job or {}).get("kernel_type") or "").strip()
+            if job_worker:
+                canonical_kernel = job_worker
+            elif job_kernel:
+                canonical_kernel = job_kernel
+        if not canonical_kernel:
+            raise ValueError("heartbeat requires a kernel type or a job with kernel_type set")
+
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        self.conn.execute("""
+        cursor = self.conn.execute("""
             UPDATE worker_state SET heartbeat_at = ?, current_task = ?,
                 process_state = ?, job_id = ?, updated_at = ?
             WHERE kernel_type = ?
-        """, (now, current_task[:200], process_state, job_id, now, kernel_type))
-        if self.conn.total_changes == 0:
-            # Row doesn't exist yet — insert minimal record
+        """, (now, current_task[:200], process_state, job_id, now, canonical_kernel))
+        if cursor.rowcount == 0:
             self.conn.execute("""
                 INSERT OR IGNORE INTO worker_state (kernel_type, heartbeat_at,
                     current_task, process_state, job_id, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (kernel_type, now, current_task[:200], process_state, job_id, now))
+            """, (canonical_kernel, now, current_task[:200], process_state, job_id, now))
         self.conn.commit()
+        return canonical_kernel
 
     def refresh_worker_state(self) -> dict:
-        """Compute worker state from TSV data + heartbeat signals.
+        """Compute worker state from structured experiment history + heartbeat."""
 
-        Hybrid approach:
-          - Self-reported: heartbeat_at, current_task, process_state (working/complete)
-          - Computed from TSV: stuck (discard streaks), idle (stale heartbeat)
-          - 'producing': last 3 experiments include a keep
-          - 'grinding':  5+ consecutive discards (spinning but not halted)
-          - 'stalled':   10+ consecutive discards or no experiments in 24h
-          - 'halted':    halt note exists in for_foreman-claude/
-          - 'idle':      no TSV file or empty
-          - 'converged': last 3 keeps are within 2% of each other
-        """
-        import csv
-
-        tsv_dirs = {
-            "attention": BWK_ROOT / "main/results/attention.tsv",
-            "gemm": BWK_ROOT / "gemm/results/gemm.tsv",
-            "fused_mlp": BWK_ROOT / "fused-mlp/results/mlp.tsv",
-            "dotproduct": BWK_ROOT / "dotproduct/results/dotproduct.tsv",
-            "linalg": BWK_ROOT / "linalg/results/linalg.tsv",
-            "lu": BWK_ROOT / "lu/results/lu.tsv",
-            "qr": BWK_ROOT / "qr/results/qr.tsv",
-            "rmsnorm": BWK_ROOT / "rmsnorm/results/rmsnorm.tsv",
-            "spmv": BWK_ROOT / "spmv/results/spmv.tsv",
-            "numerical": BWK_ROOT / "numerical/results/numerical.tsv",
-            "cuquantum": BWK_ROOT / "cuquantum/results/cuquantum.tsv",
-            "chess_training": BWK_ROOT / "chess-training/results/chess-training.tsv",
-        }
-
-        # Preserve existing heartbeat/process_state data before refresh
         existing = {}
         for row in self.conn.execute(
-            "SELECT kernel_type, heartbeat_at, current_task, job_id, process_state FROM worker_state"
+            "SELECT kernel_type, tsv_path, heartbeat_at, current_task, job_id, process_state FROM worker_state"
         ).fetchall():
             existing[row[0]] = dict(row)
 
+        kernels = set(existing.keys())
+        kernels.update(
+            r[0] for r in self.conn.execute(
+                "SELECT DISTINCT kernel_type FROM experiments WHERE kernel_type != ''"
+            ).fetchall()
+        )
+        kernels.update(
+            r[0] for r in self.conn.execute(
+                "SELECT DISTINCT kernel_type FROM jobs WHERE kernel_type != ''"
+            ).fetchall()
+        )
+
         results = {}
 
-        for kernel, tsv_path in tsv_dirs.items():
+        for kernel in sorted(kernels):
             prior = existing.get(kernel, {})
+            rows = [
+                dict(r) for r in self.conn.execute("""
+                    SELECT * FROM experiments
+                    WHERE kernel_type = ?
+                    ORDER BY COALESCE(timestamp, recorded_at) ASC, id ASC
+                """, (kernel,)).fetchall()
+            ]
+
             state = {
                 "kernel_type": kernel,
-                "tsv_path": str(tsv_path),
+                "tsv_path": prior.get("tsv_path", ""),
                 "total_experiments": 0,
                 "kept": 0,
                 "discarded": 0,
@@ -2017,85 +2380,80 @@ class ResearchMemory:
                 "last_experiment_time": "",
                 "has_halt_note": 0,
                 "status": "idle",
-                "diagnosis": "no TSV data",
+                "diagnosis": "no experiment data",
                 "heartbeat_at": prior.get("heartbeat_at", ""),
                 "current_task": prior.get("current_task", ""),
                 "job_id": prior.get("job_id"),
                 "process_state": prior.get("process_state", ""),
+                "live_status": "historical",
+                "live_reason": "no worker heartbeat recorded",
+                "activity_at": "",
             }
 
-            # Parse TSV
-            if not tsv_path.is_file():
-                results[kernel] = state
-                continue
-
-            try:
-                with open(tsv_path) as f:
-                    rows = list(csv.DictReader(f, delimiter="\t"))
-            except Exception:
-                results[kernel] = state
-                continue
-
             if not rows:
+                heartbeat_recent = False
+                if state.get("heartbeat_at"):
+                    try:
+                        import calendar
+                        hb_epoch = calendar.timegm(time.strptime(state["heartbeat_at"], "%Y-%m-%dT%H:%M:%SZ"))
+                        heartbeat_recent = (time.time() - hb_epoch) <= 600
+                    except (ValueError, OverflowError):
+                        heartbeat_recent = False
+                if state.get("process_state") == "complete":
+                    state["status"] = "complete"
+                    state["diagnosis"] = f"worker self-reported complete. task: {state.get('current_task', '')[:60]}"
+                    state["live_status"] = "complete"
+                    state["live_reason"] = f"worker self-reported complete ({state.get('heartbeat_at') or 'no heartbeat'})"
+                    state["activity_at"] = state.get("heartbeat_at", "")
+                elif heartbeat_recent:
+                    state["status"] = "producing"
+                    state["diagnosis"] = f"active worker heartbeat. task: {state.get('current_task', '')[:80]}"
+                    state["live_status"] = "active"
+                    state["live_reason"] = f"recent heartbeat ({state['heartbeat_at']})"
+                    state["activity_at"] = state.get("heartbeat_at", "")
                 results[kernel] = state
                 continue
 
-            # Compute metrics
             kept_rows = []
             streak = 0
             max_streak = 0
-
             for row in rows:
-                status = row.get("status", "").strip().lower()
-                if status in ("keep", "kept"):
+                row_status = (row.get("status") or "").strip().lower()
+                if row_status in ("keep", "kept"):
                     kept_rows.append(row)
                     streak = 0
-                elif status in ("discard", "discarded"):
+                elif row_status in ("discard", "discarded"):
                     streak += 1
                     max_streak = max(max_streak, streak)
 
-            # Current tail discard streak
             tail_streak = 0
             for row in reversed(rows):
-                if row.get("status", "").strip().lower() in ("discard", "discarded"):
+                row_status = (row.get("status") or "").strip().lower()
+                if row_status in ("discard", "discarded"):
                     tail_streak += 1
                 else:
                     break
 
-            # Best vs_ref from kept rows
             best_vsref = None
             best_duration = None
             for row in kept_rows:
-                try:
-                    vr = float(row.get("vs_ref", "0"))
-                    if best_vsref is None or vr > best_vsref:
-                        best_vsref = vr
-                except (ValueError, TypeError):
-                    pass
-                try:
-                    dur = float(row.get("duration_us", "0"))
-                    if best_duration is None or dur < best_duration:
-                        best_duration = dur
-                except (ValueError, TypeError):
-                    pass
+                vr = row.get("vs_ref")
+                if vr is not None and (best_vsref is None or vr > best_vsref):
+                    best_vsref = vr
+                dur = row.get("duration_us")
+                if dur is not None and (best_duration is None or dur < best_duration):
+                    best_duration = dur
 
-            # Top stall from most recent experiment
             last_row = rows[-1]
-            top_stall = last_row.get("top_stall", "").strip()
+            top_stall = (last_row.get("top_stall") or "").strip()
             if top_stall in ("-", "none", ""):
                 top_stall = ""
 
-            # Last kept description
             last_kept_desc = ""
             if kept_rows:
-                last_kept_desc = kept_rows[-1].get("description", "").strip()
+                last_kept_desc = (kept_rows[-1].get("description") or "").strip()
 
-            # Timestamp from last row
-            last_time = last_row.get("timestamp", "").strip()
-            if not last_time:
-                # Fall back to file modification time
-                last_time = time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                         time.gmtime(os.path.getmtime(str(tsv_path))))
+            last_time = (last_row.get("timestamp") or "").strip() or (last_row.get("recorded_at") or "").strip()
 
             # Determine status (hybrid: self-reported + computed)
             # 1. Worker self-reported "complete" → trust it
@@ -2103,17 +2461,34 @@ class ResearchMemory:
             # 3. Discard streaks → stuck/grinding (computed, worker can't see this)
             # 4. Otherwise → producing
             heartbeat_stale = False
+            heartbeat_recent = False
+            hb_epoch = None
+            last_exp_epoch = None
             if state.get("heartbeat_at"):
                 try:
                     import calendar
-                    hb_time = calendar.timegm(time.strptime(state["heartbeat_at"], "%Y-%m-%dT%H:%M:%SZ"))
-                    heartbeat_stale = (time.time() - hb_time) > 1800  # 30 min
+                    hb_epoch = calendar.timegm(time.strptime(state["heartbeat_at"], "%Y-%m-%dT%H:%M:%SZ"))
+                    heartbeat_recent = (time.time() - hb_epoch) <= 600   # 10 min
+                    heartbeat_stale = (time.time() - hb_epoch) > 1800    # 30 min
                 except (ValueError, OverflowError):
                     pass
+            try:
+                import calendar
+                last_exp_epoch = calendar.timegm(time.strptime(last_time, "%Y-%m-%dT%H:%M:%SZ"))
+            except (ValueError, OverflowError):
+                last_exp_epoch = None
 
             if state.get("process_state") == "complete":
                 status = "complete"
                 diagnosis = f"worker self-reported complete. task: {state.get('current_task', '')[:60]}"
+            elif heartbeat_recent:
+                status = "producing"
+                if tail_streak >= 5:
+                    diagnosis = f"active worker investigating prior {tail_streak}-discard streak. task: {state.get('current_task', '')[:60]}"
+                elif kept_rows:
+                    diagnosis = f"active worker heartbeat. last keep: {last_kept_desc[:80]}"
+                else:
+                    diagnosis = f"active worker heartbeat. task: {state.get('current_task', '')[:60]}"
             elif heartbeat_stale and state.get("heartbeat_at"):
                 status = "idle"
                 diagnosis = f"heartbeat stale (last: {state['heartbeat_at']})"
@@ -2147,6 +2522,28 @@ class ResearchMemory:
                 status = "producing"
                 diagnosis = f"{len(kept_rows)} kept so far, tail streak={tail_streak}"
 
+            if state.get("process_state") == "complete":
+                live_status = "complete"
+                live_reason = f"worker self-reported complete ({state.get('heartbeat_at') or 'no heartbeat'})"
+            elif heartbeat_recent:
+                live_status = "active"
+                live_reason = f"recent heartbeat ({state['heartbeat_at']})"
+            elif state.get("heartbeat_at"):
+                live_status = "stale"
+                live_reason = f"stale heartbeat ({state['heartbeat_at']})"
+            elif last_exp_epoch and (time.time() - last_exp_epoch) <= 21600:
+                live_status = "untracked_recent"
+                live_reason = f"recent experiment results without heartbeat ({last_time})"
+            elif last_time:
+                live_status = "historical"
+                live_reason = f"last experiment {last_time}"
+            else:
+                live_status = "historical"
+                live_reason = "no recent activity"
+
+            activity_candidates = [t for t in (state.get("heartbeat_at", ""), last_time) if t]
+            activity_at = max(activity_candidates) if activity_candidates else ""
+
             state.update({
                 "total_experiments": len(rows),
                 "kept": len(kept_rows),
@@ -2160,6 +2557,9 @@ class ResearchMemory:
                 "last_experiment_time": last_time,
                 "status": status,
                 "diagnosis": diagnosis,
+                "live_status": live_status,
+                "live_reason": live_reason,
+                "activity_at": activity_at,
             })
 
             results[kernel] = state
@@ -2174,8 +2574,9 @@ class ResearchMemory:
                     current_discard_streak, max_discard_streak,
                     last_kept_description, last_experiment_time,
                     has_halt_note, status, diagnosis, updated_at,
-                    heartbeat_at, current_task, job_id, process_state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    heartbeat_at, current_task, job_id, process_state,
+                    live_status, live_reason, activity_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(kernel_type) DO UPDATE SET
                     tsv_path=excluded.tsv_path,
                     total_experiments=excluded.total_experiments,
@@ -2190,7 +2591,14 @@ class ResearchMemory:
                     has_halt_note=excluded.has_halt_note,
                     status=excluded.status,
                     diagnosis=excluded.diagnosis,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    heartbeat_at=excluded.heartbeat_at,
+                    current_task=excluded.current_task,
+                    job_id=excluded.job_id,
+                    process_state=excluded.process_state,
+                    live_status=excluded.live_status,
+                    live_reason=excluded.live_reason,
+                    activity_at=excluded.activity_at
             """, (kernel, s["tsv_path"], s["total_experiments"], s["kept"],
                   s["discarded"], s["best_vsref"], s["best_duration_us"],
                   s["top_stall"], s["current_discard_streak"],
@@ -2198,9 +2606,36 @@ class ResearchMemory:
                   s["last_experiment_time"], s["has_halt_note"],
                   s["status"], s["diagnosis"], now,
                   s.get("heartbeat_at", ""), s.get("current_task", ""),
-                  s.get("job_id"), s.get("process_state", "")))
+                  s.get("job_id"), s.get("process_state", ""),
+                  s.get("live_status", ""), s.get("live_reason", ""),
+                  s.get("activity_at", "")))
 
         self.conn.commit()
+
+        for kernel, s in results.items():
+            if s.get("status") not in ("stalled", "grinding"):
+                continue
+            job_id = s.get("job_id")
+            if not job_id:
+                row = self.conn.execute("""
+                    SELECT id FROM jobs
+                    WHERE kernel_type = ?
+                      AND state NOT IN ('shipped', 'converged', 'parked', 'abandoned')
+                    ORDER BY CAST(priority AS INTEGER), updated_at DESC
+                    LIMIT 1
+                """, (kernel,)).fetchone()
+                job_id = row[0] if row else None
+            if not job_id:
+                continue
+            query = f"{BWK_ROOT}/common/memory/msearch \"{kernel} {s.get('top_stall') or 'bottleneck'}\" --kernel {kernel} -k 5"
+            body = (
+                f"Worker/progress status is {s.get('status')} for kernel '{kernel}'. Before continuing, run a research checkpoint against the DB and post the useful findings back into the work. Suggested query: {query}. If the playbook is empty, widen the search and then mark the job stuck_needs_research."
+            )
+            self.ensure_open_message('watchdog',
+                                     f"Research checkpoint required for job #{job_id}",
+                                     body=body, job_id=job_id,
+                                     message_type='info', priority='normal')
+
         return results
 
     def get_worker_state(self, kernel_type: str = None) -> list[dict]:
@@ -2212,6 +2647,12 @@ class ResearchMemory:
         else:
             rows = self.conn.execute(
                 "SELECT * FROM worker_state ORDER BY "
+                "CASE live_status "
+                "  WHEN 'active' THEN 1 "
+                "  WHEN 'stale' THEN 2 "
+                "  WHEN 'untracked_recent' THEN 3 "
+                "  WHEN 'complete' THEN 4 "
+                "  ELSE 5 END, "
                 "CASE status "
                 "  WHEN 'stalled' THEN 1 "
                 "  WHEN 'grinding' THEN 2 "
@@ -2623,6 +3064,7 @@ class ResearchMemory:
         ).fetchall()}
 
         empirical = c.execute("SELECT COUNT(*) FROM documents WHERE is_empirical = 1").fetchone()[0]
+        experiments = c.execute("SELECT COUNT(*) FROM experiments").fetchone()[0]
 
         # Chunk quality
         chunk_stats = c.execute("""
@@ -2650,6 +3092,7 @@ class ResearchMemory:
             "by_kernel_type": by_kernel,
             "by_provenance": by_provenance,
             "empirical_docs": empirical,
+            "experiments_total": experiments,
             "docs_with_summary": with_summary,
             "summary_vectors": summary_vecs,
             "chunk_avg_len": round(chunk_stats["avg_len"] or 0),
@@ -2904,6 +3347,7 @@ def cmd_stats(args):
     print(f"Size: {s['db_size_mb']} MB")
     print(f"Documents: {s['documents']}")
     print(f"Chunks: {s['chunks']}")
+    print(f"Experiments: {s['experiments_total']}")
     print(f"\nBy provenance:")
     for t, n in s["by_provenance"].items():
         boost = PROVENANCE_TIERS.get(t, {}).get("boost", 1.0)
@@ -2929,57 +3373,901 @@ def cmd_quality(args):
     mem.close()
 
 
+def cmd_maintain(args):
+    """Run maintenance: incremental ingest, gap report, promotion candidates."""
+    mem = ResearchMemory(args.db)
 
-from common.memory import memory_maintain
+    print("=" * 60)
+    print("  MEMORY DB MAINTENANCE REPORT")
+    print("=" * 60)
 
+    # Phase 1: Incremental ingest (picks up new/changed files)
+    print("\n--- Phase 1: Incremental ingest ---")
+    md_stats = mem.ingest_all()
+    tsv_stats = mem.ingest_all_tsv()
+    mem.refresh_worker_state()
+    new_md = md_stats.get("files", 0)
+    new_tsv = mem.conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0]
+    removed = md_stats.get("removed", 0)
+    print(f"  New docs indexed: {new_md}")
+    print(f"  Experiment rows in DB: {new_tsv}")
+    print(f"  Stale docs removed: {removed}")
+    print(f"  Docs skipped (unchanged): {md_stats.get('skipped', 0)}")
+    print(f"  Duplicates eliminated: {md_stats.get('dedup_skipped', 0)}")
+
+    # Phase 2: Coverage gaps
+    print("\n--- Phase 2: Coverage analysis ---")
+    stats = mem.stats()
+    total_docs = stats["documents"]
+    total_chunks = stats["chunks"]
+    by_kernel = stats.get("by_kernel_type", {})
+    by_prov = stats.get("by_provenance", {})
+
+    print(f"  Total: {total_docs} docs, {total_chunks} chunks, {stats['db_size_mb']:.1f} MB")
+    print(f"  Empirical docs: {stats.get('empirical_docs', 0)}/{total_docs} "
+          f"({100*stats.get('empirical_docs',0)/max(total_docs,1):.0f}%)")
+    print(f"  Provenance: validated={by_prov.get('validated',0)}, "
+          f"reference={by_prov.get('reference',0)}, "
+          f"research={by_prov.get('research',0)}, "
+          f"archive={by_prov.get('archive',0)}")
+
+    # Active kernels with low coverage
+    active_kernels = [
+        ("attention", BWK_ROOT / "main"),
+        ("gemm", BWK_ROOT / "gemm"),
+        ("fused_mlp", BWK_ROOT / "fused-mlp"),
+        ("dotproduct", BWK_ROOT / "dotproduct"),
+        ("linalg", BWK_ROOT / "linalg"),
+        ("qr", BWK_ROOT / "qr"),
+        ("rmsnorm", BWK_ROOT / "rmsnorm"),
+        ("spmv", BWK_ROOT / "spmv"),
+        ("numerical", BWK_ROOT / "numerical"),
+        ("cuquantum", BWK_ROOT / "cuquantum"),
+        ("chess_training", BWK_ROOT / "chess-training"),
+    ]
+
+    print("\n  Kernel coverage:")
+    gaps = []
+    for kernel, proj_dir in active_kernels:
+        doc_count = by_kernel.get(kernel, 0)
+        # Count files on disk
+        docs_dir = proj_dir / "docs"
+        claude_dir = proj_dir / ".claude"
+        on_disk = 0
+        if docs_dir.is_dir():
+            on_disk += len(list(docs_dir.glob("**/*.md")))
+        if claude_dir.is_dir():
+            on_disk += len(list(claude_dir.glob("**/*.md")))
+        coverage = f"{doc_count}/{on_disk}" if on_disk > 0 else f"{doc_count}/?"
+        flag = " *** LOW" if doc_count < 5 else ""
+        print(f"    {kernel:<16} {coverage:>10} indexed/on-disk{flag}")
+        if doc_count < 5:
+            gaps.append(kernel)
+
+    # Phase 3: Promotion candidates (research → validated)
+    print("\n--- Phase 3: Promotion candidates ---")
+    # Find research docs that are tagged empirical — these are candidates
+    # for promotion to validated provenance
+    candidates = mem.conn.execute("""
+        SELECT d.id, d.title, d.source_file, d.kernel_type, d.provenance
+        FROM documents d
+        WHERE d.provenance = 'research'
+          AND d.is_empirical = 1
+          AND d.doc_type NOT IN ('experiment', 'dead_end')
+        ORDER BY d.kernel_type, d.title
+    """).fetchall()
+
+    if candidates:
+        print(f"  {len(candidates)} empirical research docs could be promoted to 'validated':")
+        shown = 0
+        for c in candidates:
+            if shown >= 20:
+                print(f"  ... and {len(candidates) - 20} more")
+                break
+            print(f"    [{c['kernel_type']:<12}] {c['title'][:60]}")
+            shown += 1
+    else:
+        print("  No promotion candidates found.")
+
+    # Phase 4: Duplicates check
+    print("\n--- Phase 4: Duplicate check ---")
+    dupes = mem.conn.execute("""
+        SELECT content_hash, COUNT(*) as cnt
+        FROM documents
+        GROUP BY content_hash
+        HAVING cnt > 1
+    """).fetchall()
+    if dupes:
+        print(f"  WARNING: {len(dupes)} content hashes with multiple entries")
+        for d in dupes[:5]:
+            files = mem.conn.execute(
+                "SELECT source_file FROM documents WHERE content_hash = ?",
+                (d["content_hash"],)
+            ).fetchall()
+            print(f"    Hash {d['content_hash'][:12]}...: {', '.join(f['source_file'].split('/')[-1] for f in files)}")
+    else:
+        print("  Clean — no duplicates.")
+
+    # Phase 5: Summary
+    print("\n--- Summary ---")
+    if new_md or new_tsv or removed:
+        print(f"  Changes this run: +{new_md} docs, +{new_tsv} experiments, -{removed} stale")
+    else:
+        print("  No changes — database is current.")
+    if gaps:
+        print(f"  Low coverage kernels: {', '.join(gaps)}")
+    if candidates:
+        print(f"  {len(candidates)} docs ready for provenance promotion")
+
+    print()
+    mem.close()
 
 
 def cmd_serve(args):
-    from common.memory import memory_server
+    """Minimal HTTP API for programmatic access."""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from urllib.parse import urlparse, parse_qs
+
     mem = ResearchMemory(args.db)
-    memory_server.serve(mem, args.port)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+
+            if parsed.path == "/api/search":
+                query = params.get("q", [""])[0]
+                k = int(params.get("k", ["10"])[0])
+                mode = params.get("mode", ["hybrid"])[0]
+                level = int(params.get("level", ["0"])[0])
+                kernel = params.get("kernel", [None])[0]
+                doc_type = params.get("type", [None])[0]
+                stall = params.get("stall", [None])[0]
+                technique = params.get("technique", [None])[0]
+
+                if level > 0:
+                    results = mem.search_summaries(query, k, kernel, doc_type, stall, technique, level=level)
+                elif mode == "fts":
+                    results = mem.search_fts(query, k, kernel, doc_type)
+                elif mode == "semantic":
+                    results = mem.search_semantic(query, k, kernel, doc_type, stall, technique)
+                else:
+                    # Default: use summary search if summaries exist
+                    has_summaries = mem.conn.execute("SELECT COUNT(*) FROM vec_summaries").fetchone()[0]
+                    if has_summaries > 0:
+                        results = mem.search_summaries(query, k, kernel, doc_type, stall, technique, level=2)
+                    else:
+                        results = mem.search_hybrid(query, k, kernel, doc_type, stall, technique)
+
+                self._json_response({"results": results, "query": query, "count": len(results)})
+
+            elif parsed.path == "/api/stats":
+                self._json_response(mem.stats())
+
+            elif parsed.path == "/api/quality":
+                self._json_response({"report": mem.quality_report()})
+
+            elif parsed.path == "/api/workers":
+                if params.get("refresh", ["0"])[0] in ("1", "true", "yes"):
+                    mem.refresh_worker_state()
+                workers = mem.get_worker_state()
+                self._json_response({"workers": workers, "count": len(workers)})
+
+            elif parsed.path == "/api/issues":
+                status = params.get("status", [None])[0]
+                kernel = params.get("kernel", [None])[0]
+                issues = mem.get_issues(status=status, kernel_type=kernel)
+                open_count = sum(1 for i in issues if i["status"] in ("open", "assigned"))
+                self._json_response({"issues": issues, "count": len(issues), "open": open_count})
+
+            elif parsed.path.startswith("/api/issues/"):
+                # /api/issues/42/assign?to=linalg
+                # /api/issues/42/rework?fix=description
+                # /api/issues/42/close
+                # /api/issues/42/reopen?reason=still+fails
+                parts = parsed.path.split("/")
+                if len(parts) >= 4:
+                    try:
+                        issue_id = int(parts[3])
+                    except ValueError:
+                        self._json_response({"error": "Invalid issue ID"}, 400)
+                        return
+                    action = parts[4] if len(parts) > 4 else "get"
+                    if action == "assign":
+                        to = params.get("to", [""])[0]
+                        mem.assign_issue(issue_id, to)
+                        self._json_response({"ok": True, "issue_id": issue_id, "assigned_to": to})
+                    elif action == "rework":
+                        fix = params.get("fix", [""])[0]
+                        mem.rework_issue(issue_id, fix)
+                        self._json_response({"ok": True, "issue_id": issue_id, "status": "retest"})
+                    elif action == "close":
+                        mem.close_issue(issue_id)
+                        self._json_response({"ok": True, "issue_id": issue_id, "status": "closed"})
+                    elif action == "reopen":
+                        reason = params.get("reason", [""])[0]
+                        mem.reopen_issue(issue_id, reason)
+                        self._json_response({"ok": True, "issue_id": issue_id, "status": "open"})
+                    else:
+                        issues = mem.get_issues()
+                        match = [i for i in issues if i["id"] == issue_id]
+                        self._json_response(match[0] if match else {"error": "Not found"})
+
+            elif parsed.path == "/api/jobs":
+                jobs = mem.get_jobs(state=params.get("state", [None])[0],
+                                    phase=params.get("phase", [None])[0],
+                                    job_type=params.get("type", [None])[0],
+                                    kernel_type=params.get("kernel", [None])[0],
+                                    assigned_to=params.get("assigned", [None])[0],
+                                    priority=params.get("priority", [None])[0])
+                active = sum(1 for j in jobs if j["state"] not in ("shipped","converged","parked","abandoned"))
+                self._json_response({"jobs": jobs, "count": len(jobs), "active": active})
+
+            elif parsed.path.startswith("/api/jobs/"):
+                parts = parsed.path.split("/")
+                if len(parts) >= 4:
+                    if parts[3] == "new":
+                        try:
+                            jid = mem.create_job(
+                                name=params.get("name",[""])[0], title=params.get("title",[""])[0],
+                                description=params.get("description",[""])[0],
+                                job_type=params.get("type",["kernel"])[0],
+                                kernel_type=params.get("kernel",[""])[0],
+                                parent_job_id=int(params["parent"][0]) if "parent" in params else None,
+                                state=params.get("state",["wishlist"])[0],
+                                priority=params.get("priority",["3"])[0],
+                                assigned_to=params.get("assigned",[""])[0],
+                                execution_lane=params.get("lane",[""])[0],
+                                target_vs_ref=float(params["target"][0]) if "target" in params else 1.0,
+                                tags=params.get("tags",[""])[0],
+                                created_by=params.get("by",["ops"])[0],
+                                notes=params.get("notes",[""])[0])
+                            self._json_response({"ok": True, "job_id": jid})
+                        except (ValueError, sqlite3.IntegrityError) as e:
+                            self._json_response({"error": str(e)}, 400)
+                    else:
+                        try:
+                            job_id = int(parts[3])
+                        except ValueError:
+                            self._json_response({"error": "Invalid job ID"}, 400); return
+                        action = parts[4] if len(parts) > 4 else "get"
+                        if action == "get":
+                            job = mem.get_job(job_id)
+                            self._json_response(job if job else {"error": "Not found"})
+                        elif action == "transition":
+                            try:
+                                result = mem.update_job_state(job_id, params.get("to",[""])[0],
+                                    params.get("by",["ops"])[0], params.get("reason",[""])[0])
+                                self._json_response({"ok": True, "job": result})
+                            except ValueError as e:
+                                self._json_response({"error": str(e)}, 400)
+                        elif action == "history":
+                            self._json_response({"job_id": job_id, "transitions": mem.get_job_history(job_id)})
+                        elif action == "update":
+                            try:
+                                result = mem.update_job(job_id, updated_by=params.get("by",["ops"])[0],
+                                    title=params.get("title",[None])[0], description=params.get("description",[None])[0],
+                                    priority=params.get("priority",[None])[0], assigned_to=params.get("assigned",[None])[0], execution_lane=params.get("lane",[None])[0],
+                                    notes=params.get("notes",[None])[0], tags=params.get("tags",[None])[0])
+                                self._json_response({"ok": True, "job": result})
+                            except ValueError as e:
+                                self._json_response({"error": str(e)}, 400)
+                        elif action == "sync-vsref":
+                            self._json_response({"ok": True, "job": mem.sync_job_vsref(job_id)})
+                        else:
+                            self._json_response({"error": f"Unknown action: {action}"}, 400)
+
+            elif parsed.path == "/api/messages":
+                msgs = mem.get_messages(status=params.get("status",[None])[0],
+                    job_id=int(params["job"][0]) if "job" in params else None,
+                    from_agent=params.get("from",[None])[0], to_agent=params.get("to",[None])[0],
+                    message_type=params.get("type",[None])[0])
+                open_count = sum(1 for m in msgs if m["status"] == "open")
+                self._json_response({"messages": msgs, "count": len(msgs), "open": open_count})
+
+            elif parsed.path.startswith("/api/messages/"):
+                parts = parsed.path.split("/")
+                if len(parts) >= 4:
+                    if parts[3] == "new":
+                        try:
+                            mid = mem.create_message(from_agent=params.get("from",[""])[0],
+                                subject=params.get("subject",[""])[0], body=params.get("body",[""])[0],
+                                to_agent=params.get("to",[""])[0],
+                                job_id=int(params["job"][0]) if "job" in params else None,
+                                message_type=params.get("type",["info"])[0],
+                                priority=params.get("priority",["normal"])[0])
+                            self._json_response({"ok": True, "message_id": mid})
+                        except ValueError as e:
+                            self._json_response({"error": str(e)}, 400)
+                    else:
+                        try:
+                            msg_id = int(parts[3])
+                        except ValueError:
+                            self._json_response({"error": "Invalid message ID"}, 400); return
+                        action = parts[4] if len(parts) > 4 else "get"
+                        if action == "get":
+                            msg = mem.get_message(msg_id)
+                            self._json_response(msg if msg else {"error": "Not found"})
+                        elif action == "ack":
+                            self._json_response({"ok": True, "message": mem.acknowledge_message(msg_id, params.get("by",["foreman"])[0])})
+                        elif action == "resolve":
+                            self._json_response({"ok": True, "message": mem.resolve_message(msg_id, params.get("by",["foreman"])[0])})
+                        else:
+                            self._json_response({"error": f"Unknown action: {action}"}, 400)
+
+            else:
+                self._json_response({"error": "Unknown endpoint"}, 404)
+
+        def _json_response(self, data, code=200):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data, indent=2, default=str).encode())
+
+        def log_message(self, format, *a):
+            pass
+
+    port = args.port
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    print(f"Research Memory API running on http://localhost:{port}")
+    print(f"  Search:  http://localhost:{port}/api/search?q=bank+conflicts&kernel=gemm")
+    print(f"  Stats:   http://localhost:{port}/api/stats")
+    print(f"  Quality: http://localhost:{port}/api/quality")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        mem.close()
 
 
-from common.memory.memory_helpers import format_result, format_quality_result, attach_helper_methods
-ResearchMemory.PROVENANCE_TIERS = PROVENANCE_TIERS
-ResearchMemory.embed_query = staticmethod(embed_query)
-ResearchMemory.serialize_f32 = staticmethod(serialize_f32)
-ResearchMemory.validate_transition = staticmethod(validate_transition)
-ResearchMemory.ALL_JOB_STATES = ALL_JOB_STATES
-ResearchMemory.STATE_TO_PHASE = STATE_TO_PHASE
-ResearchMemory.FACTORY_MODES = FACTORY_MODES
-ResearchMemory.OPTIMIZATION_SCOPES = OPTIMIZATION_SCOPES
-ResearchMemory.EXECUTION_LANES = EXECUTION_LANES
-ResearchMemory.JOB_TYPES = JOB_TYPES
-ResearchMemory.JOB_PRIORITIES = JOB_PRIORITIES
-ResearchMemory.MESSAGE_TYPES = MESSAGE_TYPES
-ResearchMemory.MESSAGE_STATUSES = MESSAGE_STATUSES
-ResearchMemory.MESSAGE_PRIORITIES = MESSAGE_PRIORITIES
-ResearchMemory.search_summaries = _mem_search.search_summaries
-ResearchMemory.search_semantic = _mem_search.search_semantic
-ResearchMemory.search_fts = _mem_search.search_fts
-ResearchMemory.search_hybrid = _mem_search.search_hybrid
-ResearchMemory._sanitize_fts_query = staticmethod(_mem_search._sanitize_fts_query)
-_mem_messages.attach_message_methods(ResearchMemory)
-_mem_workers.attach_worker_methods(ResearchMemory)
-_mem_jobs.attach_job_methods(ResearchMemory)
-_mem_exps.attach_experiment_methods(ResearchMemory)
-_mem_stats.attach_stats_methods(ResearchMemory)
-_mem_issues.attach_issue_methods(ResearchMemory)
-attach_helper_methods(ResearchMemory)
+def main():
+    parser = argparse.ArgumentParser(
+        description="Research Memory Database for blackwell-kernels",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
+    )
+    parser.add_argument("--db", default=str(DB_PATH), help="Database path")
 
+    sub = parser.add_subparsers(dest="command")
 
-def main(argv: list[str] | None = None) -> int:
-    from common.memory import memory_cli
+    # ingest
+    p_ingest = sub.add_parser("ingest", help="Index research files (with deduplication)")
+    p_ingest.add_argument("path", nargs="?", help="Specific file or directory (default: all sources)")
+    p_ingest.add_argument("--type", default="research", help="Document type")
+    p_ingest.add_argument("--pattern", default="**/*.md", help="Glob pattern for directories")
+    p_ingest.add_argument("--force", action="store_true", help="Re-index even if unchanged")
 
-    parser = memory_cli.build_parser(default_db=str(DB_PATH))
-    args = parser.parse_args(argv)
-    if not getattr(args, "command", None):
+    # search (default: hybrid)
+    p_search = sub.add_parser("search", help="Search the research database")
+    p_search.add_argument("query", nargs="+", help="Search query")
+    p_search.add_argument("-k", type=int, default=10, help="Number of results")
+    p_search.add_argument("--mode", choices=["hybrid", "semantic", "fts"], default="hybrid")
+    p_search.add_argument("--kernel", help="Filter by kernel type")
+    p_search.add_argument("--type", help="Filter by document type")
+    p_search.add_argument("--stall", help="Filter by stall type")
+    p_search.add_argument("--technique", help="Filter by technique tag")
+    p_search.add_argument("--provenance", help="Filter by provenance tier")
+    p_search.add_argument("--detail", action="store_const", const=2, dest="level", help="Show Level 2 summaries")
+    p_search.add_argument("--full", action="store_const", const=3, dest="level", help="Show Level 3 full content")
+    p_search.add_argument("--signals", action="store_const", const=1, dest="level", help="Show Level 1 signals only")
+    p_search.set_defaults(level=0)
+    p_search.add_argument("-v", "--verbose", action="store_true")
+
+    # fts shortcut
+    p_fts = sub.add_parser("fts", help="Full-text search (exact keyword match)")
+    p_fts.add_argument("query", nargs="+")
+    p_fts.add_argument("-k", type=int, default=10)
+    p_fts.add_argument("--kernel", help="Filter by kernel type")
+    p_fts.add_argument("--type", help="Filter by document type")
+    p_fts.add_argument("-v", "--verbose", action="store_true")
+
+    # stats
+    sub.add_parser("stats", help="Show database statistics")
+
+    # quality
+    sub.add_parser("quality", help="Run quality audit report")
+
+    # ingest-tsv (for watchdog — TSV-only incremental ingest)
+    p_itsv = sub.add_parser("ingest-tsv", help="Import TSV experiments into DB and search index")
+    p_itsv.add_argument("--force", action="store_true", help="Re-index even if unchanged")
+
+    p_exp = sub.add_parser("experiment-add", help="Record one experiment row in factory_brain")
+    p_exp.add_argument("--kernel", required=True)
+    p_exp.add_argument("--status", required=True)
+    p_exp.add_argument("--description", required=True)
+    p_exp.add_argument("--timestamp", default="")
+    p_exp.add_argument("--commit", default="", dest="git_commit")
+    p_exp.add_argument("--duration-us", type=float, default=None)
+    p_exp.add_argument("--vs-ref", type=float, default=None)
+    p_exp.add_argument("--sm-pct", type=float, default=None)
+    p_exp.add_argument("--stall-math", type=float, default=None)
+    p_exp.add_argument("--stall-wait", type=float, default=None)
+    p_exp.add_argument("--stall-scoreboard", type=float, default=None)
+    p_exp.add_argument("--stall-barrier", type=float, default=None)
+    p_exp.add_argument("--top-stall", default="")
+    p_exp.add_argument("--job", type=int, default=None)
+    p_exp.add_argument("--reference-label", default="")
+    p_exp.add_argument("--source-type", default="db")
+    p_exp.add_argument("--source-path", default="")
+    p_exp.add_argument("--index", type=int, default=0)
+    p_exp.add_argument("--extra-json", default="")
+
+    p_exps = sub.add_parser("experiments", help="List experiments from factory_brain")
+    p_exps.add_argument("--kernel")
+    p_exps.add_argument("--job", type=int)
+    p_exps.add_argument("--status")
+    p_exps.add_argument("--limit", type=int, default=20)
+    p_exp_summary = sub.add_parser("experiment-summary", help="Summarize experiment history from factory_brain")
+    p_exp_summary.add_argument("--kernel")
+    p_exp_summary.add_argument("--job", type=int)
+    p_exp_summary.add_argument("--recent", type=int, default=8)
+
+    # workers — show worker state table
+    sub.add_parser("workers", help="Show computed worker state (stuck detection)")
+
+    # issues — show/manage issues
+    p_issues = sub.add_parser("issues", help="Show open issues from tester")
+    p_issues.add_argument("--status", help="Filter by status (open/assigned/retest/closed)")
+    p_issues.add_argument("--kernel", help="Filter by kernel type")
+
+    # jobs
+    p_jobs = sub.add_parser("jobs", help="List jobs (factory work items)")
+    p_jobs.add_argument("--state", help="Filter by state")
+    p_jobs.add_argument("--phase", help="Filter by phase")
+    p_jobs.add_argument("--type", dest="job_type", help="Filter by job type")
+    p_jobs.add_argument("--kernel", help="Filter by kernel type")
+    p_jobs.add_argument("--assigned", help="Filter by assigned agent")
+    p_jobs.add_argument("--priority", help="Filter by priority")
+    p_jobs.add_argument("--lane", dest="execution_lane", help="Filter by execution lane", choices=sorted(EXECUTION_LANES))
+    p_jc = sub.add_parser("job-create", help="Create a new job")
+    p_jc.add_argument("name"); p_jc.add_argument("title")
+    p_jc.add_argument("--description", default=""); p_jc.add_argument("--lane", dest="execution_lane", default="", choices=[''] + sorted(EXECUTION_LANES)); p_jc.add_argument("--type", default="kernel", dest="job_type")
+    p_jc.add_argument("--kernel", default=""); p_jc.add_argument("--parent", type=int, default=None)
+    p_jc.add_argument("--state", default="wishlist"); p_jc.add_argument("--priority", default="3")
+    p_jc.add_argument("--assigned", default=""); p_jc.add_argument("--target", type=float, default=1.0)
+    p_jc.add_argument("--tags", default=""); p_jc.add_argument("--by", default="ops")
+    p_jc.add_argument("--notes", default="")
+    p_jc.add_argument("--source-file", default="", dest="source_file", help="Path to the .cu file (1 job = 1 file)")
+    p_jc.add_argument("--factory-mode", default="", choices=sorted(FACTORY_MODES))
+    p_jc.add_argument("--objective-vector", default="")
+    p_jc.add_argument("--acceptance-gates", default="")
+    p_jc.add_argument("--keep-rule", default="")
+    p_jc.add_argument("--benchmark-set", default="")
+    p_jc.add_argument("--failure-budget", default="")
+    p_jc.add_argument("--crossover-policy", default="")
+    p_jc.add_argument("--optimization-scope", default="", choices=sorted(OPTIMIZATION_SCOPES))
+    p_jc.add_argument("--hardware-target", default="")
+    p_jc.add_argument("--retarget-policy", default="")
+    p_jc.add_argument("--reference-label", default="")
+    p_ju = sub.add_parser("job-update", help="Update job state or fields")
+    p_ju.add_argument("id", type=int); p_ju.add_argument("--state"); p_ju.add_argument("--title")
+    p_ju.add_argument("--description"); p_ju.add_argument("--priority"); p_ju.add_argument("--assigned")
+    p_ju.add_argument("--lane", dest="execution_lane", choices=sorted(EXECUTION_LANES))
+    p_ju.add_argument("--notes"); p_ju.add_argument("--tags"); p_ju.add_argument("--spec")
+    p_ju.add_argument("--factory-mode", choices=sorted(FACTORY_MODES))
+    p_ju.add_argument("--objective-vector")
+    p_ju.add_argument("--acceptance-gates")
+    p_ju.add_argument("--keep-rule")
+    p_ju.add_argument("--benchmark-set")
+    p_ju.add_argument("--failure-budget")
+    p_ju.add_argument("--crossover-policy")
+    p_ju.add_argument("--optimization-scope", choices=sorted(OPTIMIZATION_SCOPES))
+    p_ju.add_argument("--hardware-target")
+    p_ju.add_argument("--retarget-policy")
+    p_ju.add_argument("--reference-label")
+    p_ju.add_argument("--by", default="ops"); p_ju.add_argument("--reason", default="")
+    p_js = sub.add_parser("job-show", help="Show job details including spec")
+    p_js.add_argument("id", type=int)
+    p_jh = sub.add_parser("job-history", help="Show job transition history")
+    p_jh.add_argument("id", type=int)
+    p_msgs = sub.add_parser("messages", help="List messages between agents")
+    p_msgs.add_argument("--status"); p_msgs.add_argument("--job", type=int)
+    p_msgs.add_argument("--from-agent", dest="from_agent"); p_msgs.add_argument("--to-agent", dest="to_agent")
+    p_msgs.add_argument("--type", dest="msg_type")
+    p_mc = sub.add_parser("message-create", help="Send a message")
+    p_mc.add_argument("--from", required=True, dest="from_agent"); p_mc.add_argument("--subject", required=True)
+    p_mc.add_argument("--body", default=""); p_mc.add_argument("--to", default="", dest="to_agent")
+    p_mc.add_argument("--job", type=int, default=None); p_mc.add_argument("--type", default="info", dest="msg_type")
+    p_mc.add_argument("--priority", default="normal")
+    p_ma = sub.add_parser("message-ack", help="Acknowledge a message"); p_ma.add_argument("id", type=int); p_ma.add_argument("--by", default="foreman")
+    p_mr = sub.add_parser("message-resolve", help="Resolve a message"); p_mr.add_argument("id", type=int); p_mr.add_argument("--by", default="foreman")
+    p_nudge = sub.add_parser("nudge", help="Run gate logic for one job immediately")
+    p_nudge.add_argument("id", type=int, help="Job ID to nudge")
+    p_wds = sub.add_parser("watchdog-state", help="Show watchdog tick timestamps")
+    p_wds.add_argument("--name", help="Filter by watchdog tick name")
+    p_link = sub.add_parser("link-so", help="Link all compiled primitives into libbwk_primitives.so")
+    p_link.add_argument("--output", default=None, help="Output path (default: primitives/lib/libbwk_primitives.so)")
+    p_hb = sub.add_parser("heartbeat", help="Worker reports it's alive")
+    p_hb.add_argument("kernel", help="Kernel type (e.g., lu, qr)")
+    p_hb.add_argument("--task", default="", help="What you're working on")
+    p_hb.add_argument("--state", default="working", help="working or complete")
+    p_hb.add_argument("--job", type=int, default=None, help="Job ID")
+
+    # maintain — DB health check + gap report
+    sub.add_parser("maintain", help="Run maintenance: ingest new files, report gaps, suggest promotions")
+
+    # serve
+    p_serve = sub.add_parser("serve", help="Start HTTP API server")
+    p_serve.add_argument("port", nargs="?", type=int, default=8421)
+
+    args = parser.parse_args()
+
+    if args.command == "ingest":
+        cmd_ingest(args)
+    elif args.command == "ingest-tsv":
+        mem = ResearchMemory(args.db)
+        stats = mem.ingest_all_tsv(force=args.force)
+        if stats["chunks"] > 0:
+            print(f"TSV ingest: {stats['files']} files, {stats['chunks']} rows "
+                  f"({stats.get('kept', 0)} kept, {stats.get('discarded', 0)} discarded)")
+        mem.close()
+    elif args.command == "experiment-add":
+        mem = ResearchMemory(args.db)
+        extra = {}
+        if args.extra_json:
+            extra = json.loads(args.extra_json)
+        row = mem.record_experiment(
+            kernel_type=args.kernel,
+            status=args.status,
+            description=args.description,
+            timestamp=args.timestamp,
+            git_commit=args.git_commit,
+            duration_us=args.duration_us,
+            vs_ref=args.vs_ref,
+            sm_pct=args.sm_pct,
+            stall_math=args.stall_math,
+            stall_wait=args.stall_wait,
+            stall_scoreboard=args.stall_scoreboard,
+            stall_barrier=args.stall_barrier,
+            top_stall=args.top_stall,
+            job_id=args.job,
+            source_type=args.source_type,
+            source_path=args.source_path,
+            experiment_index=args.index,
+            reference_label=args.reference_label,
+            extra=extra,
+        )
+        print(f"Recorded experiment #{row.get('id', '?')} for {args.kernel}: {args.status}")
+        mem.close()
+    elif args.command == "experiments":
+        mem = ResearchMemory(args.db)
+        rows = mem.get_experiments(kernel_type=args.kernel, job_id=args.job,
+                                   status=args.status, limit=args.limit)
+        if not rows:
+            print("No experiments found.")
+        else:
+            print(f"\n{'ID':>5} {'KERNEL':<14} {'STATUS':<9} {'VS_REF':>7} {'DUR(us)':>9} {'WHEN':<20} DESCRIPTION")
+            print("-" * 110)
+            for r in rows:
+                vs = f"{r['vs_ref']:.2f}" if r.get("vs_ref") is not None else "-"
+                dur = f"{r['duration_us']:.1f}" if r.get("duration_us") is not None else "-"
+                when = (r.get("timestamp") or r.get("recorded_at") or "")[:20]
+                print(f"{r['id']:>5} {r['kernel_type']:<14} {r['status']:<9} {vs:>7} {dur:>9} {when:<20} {(r.get('description') or '')[:40]}")
+        mem.close()
+    elif args.command == "experiment-summary":
+        mem = ResearchMemory(args.db)
+        summary = mem.summarize_experiments(kernel_type=args.kernel, job_id=args.job, recent=args.recent)
+        if summary["total"] == 0:
+            print("No experiments found.")
+        else:
+            print(f"Kernel: {summary.get('kernel_type') or '-'}")
+            print(f"Job: {summary.get('job_id') if summary.get('job_id') is not None else '-'}")
+            print(f"Total: {summary['total']}  kept={summary['kept']}  discarded={summary['discarded']}  unknown={summary['unknown']}")
+            print(f"Discard streak: current={summary['current_discard_streak']} max={summary['max_discard_streak']}")
+            best = summary.get("best_keep")
+            if best:
+                vs = f"{best['vs_ref']:.2f}x" if best.get("vs_ref") is not None else "-"
+                dur = f"{best['duration_us']:.1f}us" if best.get("duration_us") is not None else "-"
+                print(f"Best keep: #{best['id']} {vs} {dur}  {((best.get('description') or '')[:120])}")
+            last_keep = summary.get("last_keep")
+            if last_keep:
+                print(f"Last keep: #{last_keep['id']} {(last_keep.get('timestamp') or last_keep.get('recorded_at') or '')[:20]}  {((last_keep.get('description') or '')[:120])}")
+            last = summary.get("last_experiment")
+            if last:
+                print(f"Last experiment: #{last['id']} {last.get('status', '-'):<8} {(last.get('timestamp') or last.get('recorded_at') or '')[:20]}  {((last.get('description') or '')[:120])}")
+            if summary["top_stalls"]:
+                print("Top stalls:")
+                for item in summary["top_stalls"]:
+                    print(f"  - {item['stall']}: {item['count']}")
+            if summary["recent_discards"]:
+                print("Recent discards:")
+                for row in summary["recent_discards"]:
+                    print(f"  - #{row['id']} {(row.get('top_stall') or '-'): <18} {((row.get('description') or '')[:120])}")
+            if summary["recent_keeps"]:
+                print("Recent keeps:")
+                for row in summary["recent_keeps"]:
+                    vs = f"{row['vs_ref']:.2f}x" if row.get("vs_ref") is not None else "-"
+                    print(f"  - #{row['id']} {vs:>7} {(row.get('top_stall') or '-'): <18} {((row.get('description') or '')[:120])}")
+            print("Recent history:")
+            for row in summary["recent"]:
+                when = (row.get("timestamp") or row.get("recorded_at") or "")[:20]
+                print(f"  - #{row['id']} {row.get('status', '-'):<8} {when} {((row.get('description') or '')[:100])}")
+        mem.close()
+    elif args.command == "workers":
+        mem = ResearchMemory(args.db)
+        mem.refresh_worker_state()
+        workers = mem.get_worker_state()
+        # Status badges
+        badges = {
+            "stalled": "\033[31mSTALLED\033[0m",
+            "grinding": "\033[33mGRINDING\033[0m",
+            "halted": "\033[35mHALTED\033[0m",
+            "producing": "\033[32mPRODUCING\033[0m",
+            "converged": "\033[36mCONVERGED\033[0m",
+            "idle": "\033[2mIDLE\033[0m",
+            "unknown": "\033[2m???\033[0m",
+        }
+        print(f"\n{'KERNEL':<16} {'STATUS':<12} {'BEST':>6} {'EXP':>5} {'KEPT':>5} "
+              f"{'LIVE':<16} {'STREAK':>6} {'STALL':<18} DIAGNOSIS")
+        print("-" * 126)
+        for w in workers:
+            badge = badges.get(w["status"], w["status"])
+            vsref = f"{w['best_vsref']:.2f}x" if w["best_vsref"] else "-"
+            print(f"{w['kernel_type']:<16} {badge:<21} {vsref:>6} {w['total_experiments']:>5} "
+                  f"{w['kept']:>5} {(w.get('live_status') or '-'): <16} {w['current_discard_streak']:>6} "
+                  f"{w['top_stall']:<18} {w['diagnosis'][:50]}")
+        print()
+        # Summary
+        stuck = sum(1 for w in workers if w["status"] in ("stalled", "grinding"))
+        halted = sum(1 for w in workers if w["status"] == "halted")
+        producing = sum(1 for w in workers if w["status"] == "producing")
+        if stuck:
+            print(f"  \033[31m{stuck} workers need attention (stalled/grinding)\033[0m")
+        if halted:
+            print(f"  \033[35m{halted} workers halted (check halt notes)\033[0m")
+        print(f"  {producing} workers producing")
+        mem.close()
+    elif args.command == "search":
+        cmd_search(args)
+    elif args.command == "fts":
+        args.mode = "fts"
+        args.stall = None
+        args.technique = None
+        args.provenance = None
+        cmd_search(args)
+    elif args.command == "stats":
+        cmd_stats(args)
+    elif args.command == "quality":
+        cmd_quality(args)
+    elif args.command == "issues":
+        mem = ResearchMemory(args.db)
+        issues = mem.get_issues(status=args.status, kernel_type=args.kernel)
+        if not issues:
+            print("No issues found.")
+        else:
+            # Status badges
+            status_badges = {
+                "open": "\033[31mOPEN\033[0m",
+                "assigned": "\033[33mASSIGNED\033[0m",
+                "retest": "\033[36mRETEST\033[0m",
+                "closed": "\033[32mCLOSED\033[0m",
+            }
+            sev_badges = {
+                "blocking": "\033[31mBLOCKING\033[0m",
+                "correctness": "\033[33mCORRECTNESS\033[0m",
+                "warning": "\033[2mWARNING\033[0m",
+            }
+            print(f"\n{'ID':>4}  {'STATUS':<10} {'SEVERITY':<14} {'KERNEL':<14} {'ASSIGNED':<12} TITLE")
+            print("-" * 100)
+            for issue in issues:
+                status_b = status_badges.get(issue["status"], issue["status"])
+                sev_b = sev_badges.get(issue["severity"], issue["severity"])
+                assigned = issue["assigned_to"] or "-"
+                print(f"{issue['id']:>4}  {status_b:<19} {sev_b:<23} {issue['kernel_type']:<14} "
+                      f"{assigned:<12} {issue['title'][:50]}")
+            print()
+            open_count = sum(1 for i in issues if i["status"] in ("open", "assigned"))
+            retest_count = sum(1 for i in issues if i["status"] == "retest")
+            if open_count:
+                print(f"  \033[31m{open_count} open issues need attention\033[0m")
+            if retest_count:
+                print(f"  \033[36m{retest_count} issues awaiting re-test\033[0m")
+        mem.close()
+    elif args.command == "jobs":
+        mem = ResearchMemory(args.db)
+        jobs = mem.get_jobs(state=args.state, phase=args.phase, job_type=getattr(args,"job_type",None),
+                            kernel_type=args.kernel, assigned_to=args.assigned, priority=args.priority, execution_lane=getattr(args, 'execution_lane', None))
+        if not jobs:
+            print("No jobs found.")
+        else:
+            phase_colors = {"ideation":"\033[2m","development":"\033[33m","validation":"\033[36m",
+                            "rework":"\033[31m","quality":"\033[35m","shipping":"\033[32m","terminal":"\033[2m"}
+            rst = "\033[0m"
+            print(f"\n{'ID':>4}  {'STATE':<20} {'PHASE':<13} {'PRI':<8} {'KERNEL':<12} {'ASSIGNED':<10} {'LANE':<11} {'V':>3} {'VS_REF':>7}  TITLE")
+            print("-" * 115)
+            for j in jobs:
+                pc = phase_colors.get(j["phase"],"")
+                vs = f"{j['vs_ref']:.2f}" if j["vs_ref"] else "-"
+                ver = j.get('version', 0) or 0
+                ver_s = f"{ver:.1f}" if ver > 0 else "-"
+                print(f"{j['id']:>4}  {pc}{j['state']:<20}{rst} {j['phase']:<13} {j['priority']:<8} "
+                      f"{(j['kernel_type'] or '-'):<12} {(j['assigned_to'] or '-'):<10} {(j.get('execution_lane') or '-'):<11} {ver_s:>5} {vs:>7}  {j['title'][:40]}")
+            print()
+            all_jobs = mem.get_jobs()
+            lane_counts = {
+                'active': sum(1 for j in all_jobs if (j.get('execution_lane') or '') == 'active'),
+                'hopper': sum(1 for j in all_jobs if (j.get('execution_lane') or '') == 'hopper'),
+                'incubating': sum(1 for j in all_jobs if (j.get('execution_lane') or '') == 'incubating'),
+                'parked': sum(1 for j in all_jobs if (j.get('execution_lane') or '') == 'parked'),
+            }
+            print(f"  lanes: active={lane_counts['active']} hopper={lane_counts['hopper']} incubating={lane_counts['incubating']} parked={lane_counts['parked']}")
+        mem.close()
+    elif args.command == "job-create":
+        mem = ResearchMemory(args.db)
+        try:
+            jid = mem.create_job(name=args.name, title=args.title, description=args.description,
+                job_type=args.job_type, kernel_type=args.kernel, parent_job_id=args.parent,
+                state=args.state, priority=args.priority, assigned_to=args.assigned, execution_lane=args.execution_lane,
+                target_vs_ref=args.target, tags=args.tags, created_by=args.by,
+                notes=args.notes, source_file=args.source_file,
+                factory_mode=args.factory_mode, objective_vector=args.objective_vector,
+                acceptance_gates=args.acceptance_gates, keep_rule=args.keep_rule,
+                benchmark_set=args.benchmark_set, failure_budget=args.failure_budget,
+                crossover_policy=args.crossover_policy,
+                optimization_scope=args.optimization_scope,
+                hardware_target=args.hardware_target,
+                retarget_policy=args.retarget_policy,
+                reference_label=args.reference_label)
+            print(f"Created job #{jid}: {args.name} ({args.state})")
+        except (ValueError, sqlite3.IntegrityError) as e:
+            print(f"Error: {e}", file=sys.stderr); sys.exit(1)
+        mem.close()
+    elif args.command == "job-update":
+        mem = ResearchMemory(args.db)
+        try:
+            if args.state:
+                result = mem.update_job_state(args.id, args.state, changed_by=args.by, reason=args.reason)
+                print(f"Job #{args.id} ({result['name']}): {result['state']} [{result['phase']}]  by {args.by}")
+            else:
+                result = mem.update_job(args.id, updated_by=args.by, title=args.title, description=args.description,
+                    priority=args.priority, assigned_to=args.assigned, execution_lane=args.execution_lane, notes=args.notes, tags=args.tags,
+                    spec=args.spec, factory_mode=args.factory_mode, objective_vector=args.objective_vector,
+                    acceptance_gates=args.acceptance_gates, keep_rule=args.keep_rule,
+                    benchmark_set=args.benchmark_set, failure_budget=args.failure_budget,
+                    crossover_policy=args.crossover_policy,
+                    optimization_scope=args.optimization_scope,
+                    hardware_target=args.hardware_target,
+                    retarget_policy=args.retarget_policy,
+                    reference_label=args.reference_label)
+                print(f"Job #{args.id} ({result['name']}): updated")
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr); sys.exit(1)
+        mem.close()
+    elif args.command == "job-show":
+        mem = ResearchMemory(args.db)
+        job = mem.get_job(args.id)
+        if not job:
+            print(f"Job #{args.id} not found.", file=sys.stderr); sys.exit(1)
+        ver = job.get('version', 0) or 0
+        ver_s = f"v{ver:.1f}" if ver > 0 else "unshipped"
+        print(f"Job #{job['id']}: {job['title']}")
+        print(f"  State: {job['state']} [{job['phase']}] | Version: {ver_s}")
+        print(f"  Priority: {job['priority']} | Kernel: {job['kernel_type'] or '-'} | Assigned: {job['assigned_to'] or '-'} | Lane: {job.get('execution_lane') or '-'}")
+        if job.get('factory_mode'):
+            print(f"  Factory Mode: {job['factory_mode']}")
+        if job.get('optimization_scope'):
+            print(f"  Optimization Scope: {job['optimization_scope']}")
+        if job.get('hardware_target'):
+            print(f"  Hardware Target: {job['hardware_target']}")
+        if job.get('description'): print(f"  Description: {job['description']}")
+        if job.get('notes'): print(f"  Notes: {job['notes']}")
+        if job.get('objective_vector'): print(f"  Objective Vector: {job['objective_vector']}")
+        if job.get('acceptance_gates'): print(f"  Acceptance Gates: {job['acceptance_gates']}")
+        if job.get('keep_rule'): print(f"  Keep Rule: {job['keep_rule']}")
+        if job.get('benchmark_set'): print(f"  Benchmark Set: {job['benchmark_set']}")
+        if job.get('failure_budget'): print(f"  Failure Budget: {job['failure_budget']}")
+        if job.get('crossover_policy'): print(f"  Crossover Policy: {job['crossover_policy']}")
+        if job.get('retarget_policy'): print(f"  Retarget Policy: {job['retarget_policy']}")
+        if job.get('reference_label'): print(f"  Reference Label: {job['reference_label']}")
+        if job.get('spec'):
+            print(f"\n{job['spec']}")
+        else:
+            print("\n  (no spec attached)")
+        mem.close()
+    elif args.command == "job-history":
+        mem = ResearchMemory(args.db)
+        job = mem.get_job(args.id)
+        if not job:
+            print(f"Job #{args.id} not found.", file=sys.stderr); sys.exit(1)
+        history = mem.get_job_history(args.id)
+        print(f"\nJob #{args.id}: {job['name']} — {job['title']}\nCurrent: {job['state']} [{job['phase']}]\n")
+        if history:
+            print(f"{'TIMESTAMP':<26} {'FROM':<20} {'TO':<20} {'BY':<10} REASON")
+            print("-" * 100)
+            for t in history:
+                print(f"{t['timestamp']:<26} {(t['from_state'] or '(new)'):<20} {t['to_state']:<20} {t['changed_by']:<10} {t['reason'][:40]}")
+        mem.close()
+    elif args.command == "messages":
+        mem = ResearchMemory(args.db)
+        msgs = mem.get_messages(status=args.status, job_id=args.job, from_agent=args.from_agent,
+            to_agent=args.to_agent, message_type=args.msg_type)
+        if not msgs:
+            print("No messages found.")
+        else:
+            sb = {"open":"\033[31mOPEN\033[0m","acknowledged":"\033[33mACK\033[0m","resolved":"\033[32mDONE\033[0m"}
+            print(f"\n{'ID':>4}  {'STATUS':<14} {'TYPE':<10} {'FROM':<12} {'TO':<12} {'JOB':>4}  SUBJECT")
+            print("-" * 100)
+            for m in msgs:
+                print(f"{m['id']:>4}  {sb.get(m['status'],m['status']):<23} {m['message_type']:<10} "
+                      f"{m['from_agent']:<12} {(m['to_agent'] or '*'):<12} {str(m['job_id'] or '-'):>4}  {m['subject'][:40]}")
+            print(f"\n  {sum(1 for m in msgs if m['status']=='open')} open")
+        mem.close()
+    elif args.command == "message-create":
+        mem = ResearchMemory(args.db)
+        mid = mem.create_message(from_agent=args.from_agent, subject=args.subject, body=args.body,
+            to_agent=args.to_agent, job_id=args.job, message_type=args.msg_type, priority=args.priority)
+        print(f"Created message #{mid}: {args.subject}"); mem.close()
+    elif args.command == "message-ack":
+        mem = ResearchMemory(args.db)
+        mem.acknowledge_message(args.id, by=args.by); print(f"Message #{args.id}: acknowledged"); mem.close()
+    elif args.command == "message-resolve":
+        mem = ResearchMemory(args.db)
+        mem.resolve_message(args.id, by=args.by); print(f"Message #{args.id}: resolved"); mem.close()
+    elif args.command == "watchdog-state":
+        mem = ResearchMemory(args.db)
+        if args.name:
+            rows = [mem.get_watchdog_state(args.name)]
+            rows = [r for r in rows if r]
+        else:
+            rows = [
+                dict(r) for r in mem.conn.execute(
+                    "SELECT * FROM watchdog_state ORDER BY CASE name WHEN 'watchdog_daemon' THEN 0 ELSE 1 END, name"
+                ).fetchall()
+            ]
+        if not rows:
+            print("No watchdog state found.")
+        else:
+            print(f"\n{'NAME':<20} {'LAST RUN':<22} {'STATUS':<12} NOTES")
+            print("-" * 100)
+            for row in rows:
+                last_run = row.get('last_run_at') or '-'
+                status = row.get('last_status') or '-'
+                notes = row.get('notes') or ''
+                print(f"{row['name']:<20} {last_run:<22} {status:<12} {notes}")
+        mem.close()
+    elif args.command == "link-so":
+        result = ResearchMemory.link_primitives_so(output_path=args.output)
+        if result["ok"]:
+            print(f"Linked {result['objects']} objects → {result['output']} ({result['size_mb']} MB)")
+        else:
+            print(f"Error: {result['error']}", file=sys.stderr); sys.exit(1)
+    elif args.command == "heartbeat":
+        mem = ResearchMemory(args.db)
+        canonical = mem.worker_heartbeat(args.kernel, current_task=args.task,
+                                         process_state=args.state, job_id=args.job)
+        print(f"Heartbeat: {canonical} [{args.state}] {args.task[:60]}")
+        mem.close()
+    elif args.command == "nudge":
+        # Nudge = run the SAME gate logic as watchdog.sh, for one job, right now.
+        # No duplicate code — just call the watchdog's gate processing inline.
+        import subprocess
+        job_id = args.id
+        print(f"Nudging job #{job_id} through watchdog gate...")
+        result = subprocess.run(
+            ['bash', '-c', f'''
+TRANSFORMERS_NO_TF=1 TF_CPP_MIN_LOG_LEVEL=3 python3 -c "
+import sys; sys.path.insert(0, str(BWK_ROOT / 'common' / 'memory'))
+exec(open(str(BWK_ROOT / 'common' / 'scripts' / 'gate_process.py')).read())
+gate_process_job({job_id})
+"'''],
+            capture_output=True, text=True, timeout=900
+        )
+        if result.stdout: print(result.stdout.rstrip())
+        if result.stderr: print(result.stderr.rstrip(), file=sys.stderr)
+        # Show final state
+        mem = ResearchMemory(args.db)
+        job = mem.get_job(job_id)
+        if job:
+            print(f"\nFinal: {job['state']} [{job['phase']}]")
+        mem.close()
+    elif args.command == "maintain":
+        cmd_maintain(args)
+    elif args.command == "serve":
+        cmd_serve(args)
+    else:
         parser.print_help()
-        return 0
-    memory_cli.run(args)
-    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
