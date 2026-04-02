@@ -78,6 +78,12 @@ LOOPS=(
     # Format: name|tmux_session|legacy_results_tsv|resume_cmd|launch_cmd|cwd
     "gemm|gemm|$REPO_ROOT/gemm/results/gemm.tsv|@active-prompt:gemm|claude --dangerously-skip-permissions|$REPO_ROOT/gemm"
     "octave-gpu|octave-gpu||@active-prompt:octave-gpu|claude --dangerously-skip-permissions|$REPO_ROOT/octave-gpu"
+    #
+    # --- 3 Codex workers (each owns a distinct job so file conflicts are rare) ---
+    # cx1=dgetrs #50  cx2=dgesv #33  cx3=dnrm2 #31  (all in octave-gpu/)
+    "cx1|cx1||@active-prompt:cx1|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/octave-gpu"
+    "cx2|cx2||@active-prompt:cx2|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/octave-gpu"
+    "cx3|cx3||@active-prompt:cx3|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/octave-gpu"
 
     # --- NEVER add this — chess-training is Darrell's live ML training, not a worker ---
     # chess-training: RNN training in progress, not a kernel optimization loop
