@@ -226,11 +226,96 @@ def test_qr_sizes(qr_fn):
             check(f"{M}x{N}", False, f"CRASHED: {e}")
 
 
+def test_dormqr_left_notrans(dormqr_fn):
+    """Test dormqr side=L trans=N: Q*I = Q (orthogonal columns)."""
+    print("\n=== dormqr: Left/No-trans ===")
+    import numpy as np
+    # shapes: (M_qr, K, N_c) — A is M_qr x K, C is M_qr x N_c
+    cases = [
+        (16, 8, 4), (32, 16, 8), (64, 32, 16), (65, 33, 17),
+        (128, 64, 32), (256, 128, 64), (512, 256, 128),
+    ]
+    for M, K, Nc in cases:
+        rng = np.random.default_rng(seed=M * 100 + K)
+        A = rng.standard_normal((M, K))
+        C = np.eye(M, Nc)  # apply Q to first Nc cols of identity
+        try:
+            QC = dormqr_fn(A, C, side='L', trans='N')
+            # Q^T * Q ≈ I for the first K columns
+            Kc = min(K, Nc)
+            Qk = QC[:, :Kc]
+            gram = Qk.T @ Qk
+            orth_err = np.linalg.norm(gram - np.eye(Kc))
+            check(f"L/N {M}x{K} C={M}x{Nc} orthogonality",
+                  orth_err < max(M, K) * 2.3e-13,
+                  f"orth_err={orth_err:.2e}")
+        except Exception as e:
+            check(f"L/N {M}x{K} C={M}x{Nc}", False, f"CRASHED: {e}")
+
+
+def test_dormqr_roundtrip(dormqr_fn):
+    """Test Q^T*(Q*C)=C round-trip for side=L and side=R."""
+    print("\n=== dormqr: Round-trip Q^T*(Q*C)=C and (C*Q)*Q^T=C ===")
+    import numpy as np
+    rng = np.random.default_rng(seed=42)
+
+    # Left round-trip cases: (M_qr, K, Nc)
+    left_cases = [
+        (16, 8, 4), (32, 16, 8), (64, 32, 16), (128, 64, 32),
+        (256, 128, 64), (512, 256, 128),
+    ]
+    for M, K, Nc in left_cases:
+        A = rng.standard_normal((M, K))
+        C0 = rng.standard_normal((M, Nc))
+        try:
+            QC  = dormqr_fn(A, C0.copy(), side='L', trans='N')
+            C1  = dormqr_fn(A, QC,          side='L', trans='T')
+            ref_norm = np.linalg.norm(C0)
+            rel = np.linalg.norm(C1 - C0) / (ref_norm + 1e-300)
+            check(f"L roundtrip {M}x{K} C={M}x{Nc}",
+                  rel < max(M, K) * 2.3e-13, f"rel={rel:.2e}")
+        except Exception as e:
+            check(f"L roundtrip {M}x{K} C={M}x{Nc}", False, f"CRASHED: {e}")
+
+    # Right round-trip cases: (N_qr, K, Mc)
+    right_cases = [
+        (16, 8, 4), (32, 16, 8), (64, 32, 16), (128, 64, 32),
+        (256, 128, 64),
+    ]
+    for N, K, Mc in right_cases:
+        A = rng.standard_normal((N, K))
+        C0 = rng.standard_normal((Mc, N))
+        try:
+            CQ  = dormqr_fn(A, C0.copy(), side='R', trans='N')
+            C1  = dormqr_fn(A, CQ,          side='R', trans='T')
+            ref_norm = np.linalg.norm(C0)
+            rel = np.linalg.norm(C1 - C0) / (ref_norm + 1e-300)
+            check(f"R roundtrip {N}x{K} C={Mc}x{N}",
+                  rel < max(N, K) * 2.3e-13, f"rel={rel:.2e}")
+        except Exception as e:
+            check(f"R roundtrip {N}x{K} C={Mc}x{N}", False, f"CRASHED: {e}")
+
+
+def test_dormqr_degenerate(dormqr_fn):
+    """Test dormqr with zero sizes and K=0."""
+    print("\n=== dormqr: Degenerate inputs ===")
+    import numpy as np
+    # K=0 (no reflectors) — C should be unchanged
+    A0 = np.zeros((8, 0))
+    C0 = np.arange(32, dtype=np.float64).reshape(8, 4)
+    try:
+        C1 = dormqr_fn(A0, C0.copy(), side='L', trans='N')
+        err = np.linalg.norm(C1 - C0)
+        check("K=0 C unchanged", err == 0.0 or err < 1e-14, f"err={err:.2e}")
+    except Exception as e:
+        check("K=0 C unchanged", False, f"CRASHED: {e}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="BLAS Compliance Test")
     parser.add_argument("module", nargs="?", help="Python module path")
     parser.add_argument("function", nargs="?", help="Function name")
-    parser.add_argument("--op", default="gemm", help="Operation: gemm|chol|lu|qr|all")
+    parser.add_argument("--op", default="gemm", help="Operation: gemm|chol|lu|qr|dormqr|all")
     parser.add_argument("--self-test", action="store_true", help="Test against torch builtins")
     args = parser.parse_args()
 
@@ -241,6 +326,7 @@ if __name__ == "__main__":
         chol_fn = lambda A: torch.linalg.cholesky(A)
         lu_fn = lambda A: torch.linalg.lu(A)
         qr_fn = lambda A: torch.linalg.qr(A)
+        dormqr_fn = None
     else:
         spec = importlib.util.spec_from_file_location("mod", args.module)
         mod = importlib.util.module_from_spec(spec)
@@ -250,6 +336,7 @@ if __name__ == "__main__":
         chol_fn = fn
         lu_fn = fn
         qr_fn = fn
+        dormqr_fn = fn
 
     op = args.op.lower()
     if op in ("gemm", "all"):
@@ -265,6 +352,10 @@ if __name__ == "__main__":
         test_lu_sizes(lu_fn)
     if op in ("qr", "all"):
         test_qr_sizes(qr_fn)
+    if op in ("dormqr",) and dormqr_fn is not None:
+        test_dormqr_left_notrans(dormqr_fn)
+        test_dormqr_roundtrip(dormqr_fn)
+        test_dormqr_degenerate(dormqr_fn)
 
     print(f"\n{'='*60}")
     print(f"RESULTS: {PASS} passed, {FAIL} failed out of {PASS+FAIL} tests")
