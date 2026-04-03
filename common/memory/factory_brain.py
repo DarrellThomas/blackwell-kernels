@@ -4244,14 +4244,20 @@ def main():
         import subprocess
         job_id = args.id
         print(f"Nudging job #{job_id} through watchdog gate...")
+        gate_code = f'''
+from pathlib import Path
+import sys
+BWK_ROOT = Path({str(BWK_ROOT)!r})
+sys.path.insert(0, str(BWK_ROOT / 'common' / 'memory'))
+script_path = BWK_ROOT / 'common' / 'scripts' / 'gate_process.py'
+namespace = {{'__name__': 'factory_brain_nudge', '__file__': str(script_path)}}
+exec(compile(script_path.read_text(), str(script_path), 'exec'), namespace)
+namespace['gate_process_job']({job_id})
+'''
         result = subprocess.run(
-            ['bash', '-c', f'''
-TRANSFORMERS_NO_TF=1 TF_CPP_MIN_LOG_LEVEL=3 python3 -c "
-import sys; sys.path.insert(0, str(BWK_ROOT / 'common' / 'memory'))
-exec(open(str(BWK_ROOT / 'common' / 'scripts' / 'gate_process.py')).read())
-gate_process_job({job_id})
-"'''],
-            capture_output=True, text=True, timeout=900
+            ['python3', '-c', gate_code],
+            capture_output=True, text=True, timeout=900,
+            env={**os.environ, 'TRANSFORMERS_NO_TF': '1', 'TF_CPP_MIN_LOG_LEVEL': '3'},
         )
         if result.stdout: print(result.stdout.rstrip())
         if result.stderr: print(result.stderr.rstrip(), file=sys.stderr)

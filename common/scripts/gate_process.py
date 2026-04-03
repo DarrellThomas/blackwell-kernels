@@ -110,9 +110,25 @@ def ensure_repo_clean(project_dir):
         return False, dirty
     return True, ''
 
-def update_phase_context(kernel, new_state):
+def resolve_job_project_dir(job):
+    assigned = (job.get('assigned_to') or '').strip()
+    if assigned in ('octave-gpu', 'cx1', 'cx2', 'cx3', 'cx4'):
+        candidate = REPO_ROOT / 'octave-gpu'
+        if candidate.is_dir():
+            return candidate
+
+    kernel = (job.get('kernel_type') or '').strip()
+    if kernel:
+        candidate = REPO_ROOT / kernel
+        if candidate.is_dir():
+            return candidate
+
+    return None
+
+
+def update_phase_context(project_dir, new_state):
     """Copy the right phase context file into the worker's .claude/ directory."""
-    target = str((REPO_ROOT / kernel) / '.claude/phase_context.md')
+    target = str(Path(project_dir) / '.claude/phase_context.md')
     phase = 'development'
     for p, states in _PHASE_MAP.items():
         if new_state in states:
@@ -121,7 +137,7 @@ def update_phase_context(kernel, new_state):
     src = f'{PHASES_DIR}/{phase}.md'
     if os.path.isfile(src) and os.path.isdir(os.path.dirname(target)):
         shutil.copy2(src, target)
-        print(f'[gate] {kernel}: phase context -> {phase}.md')
+        print(f'[gate] {Path(project_dir).name}: phase context -> {phase}.md')
 
 
 def gate_process_job(job_id):
@@ -134,7 +150,8 @@ def gate_process_job(job_id):
         return
 
     jid, name, state, kernel = job['id'], job['name'], job['state'], job['kernel_type']
-    project_dir = str(REPO_ROOT / kernel) if kernel else None if kernel else None
+    project_path = resolve_job_project_dir(job)
+    project_dir = str(project_path) if project_path else None
     print(f'Job #{jid} ({name}): {state} [{job["phase"]}]')
 
 
@@ -142,7 +159,7 @@ def gate_process_job(job_id):
     if state == 'testing_pass' and project_dir:
         print(f'  → running edge tests and compliance suite...')
         mem.update_job_state(jid, 'edge_testing', 'gate', 'running compliance + edge tests')
-        if kernel: update_phase_context(kernel, 'edge_testing')
+        if project_dir: update_phase_context(project_dir, 'edge_testing')
 
         env = dict(os.environ, CUDA_VISIBLE_DEVICES='1', PYTHONPATH=f'{project_dir}/python')
         all_passed = True
@@ -194,7 +211,7 @@ def gate_process_job(job_id):
                 f"When all suites exist and pass locally, advance job to testing_pass."
             )
             mem.update_job_state(jid, 'tests_writing', 'gate', f'missing test suites: {cats}')
-            if kernel: update_phase_context(kernel, 'tests_writing')
+            if project_dir: update_phase_context(project_dir, 'tests_writing')
             mem.ensure_open_message('gate', f'Test suites needed for {name}',
                 body=body, job_id=jid, message_type='directive', priority='normal')
             print(f'  → tests_writing: missing {cats}')
@@ -215,7 +232,7 @@ def gate_process_job(job_id):
     if state == 'edge_pass' and project_dir:
         print(f'  → running linter...')
         mem.update_job_state(jid, 'linting', 'gate', 'running linter')
-        if kernel: update_phase_context(kernel, 'linting')
+        if project_dir: update_phase_context(project_dir, 'linting')
 
         lint_script = f'{SCRIPTS}/lint_cuda.py'
         cu_files = glob.glob(f'{project_dir}/csrc/{kernel}/*.cu') if project_dir else []
@@ -250,7 +267,7 @@ def gate_process_job(job_id):
     if state in ('lint_pass', 'ready_to_ship'):
         if state == 'lint_pass':
             mem.update_job_state(jid, 'ready_to_ship', 'gate', 'lint passed')
-            if kernel: update_phase_context(kernel, 'ready_to_ship')
+            if project_dir: update_phase_context(project_dir, 'ready_to_ship')
         if project_dir:
             clean, dirty = ensure_repo_clean(project_dir)
             if not clean:
@@ -290,7 +307,7 @@ def gate_process_job(job_id):
     # --- Fail states → rework ---
     if state in ('testing_fail', 'edge_fail', 'lint_fail'):
         mem.update_job_state(jid, 'rework', 'gate', f'{state} → rework')
-        if kernel: update_phase_context(kernel, 'rework')
+        if project_dir: update_phase_context(project_dir, 'rework')
         mem.ensure_open_message('gate', f'{name} sent back for rework ({state})',
             job_id=jid, message_type='directive', priority='normal')
         print(f'  → sent back to rework')
