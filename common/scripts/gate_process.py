@@ -15,7 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMMON_DIR = REPO_ROOT / "common"
 sys.path.insert(0, str(COMMON_DIR / "memory"))
-from factory_brain import ResearchMemory
+from factory_brain import ResearchMemory, describe_job_shipping, resolve_job_project_dir as resolve_factory_job_project_dir
 
 SCRIPTS = str(COMMON_DIR / "scripts")
 PHASES_DIR = str(COMMON_DIR / "claude" / "phases")
@@ -111,19 +111,7 @@ def ensure_repo_clean(project_dir):
     return True, ''
 
 def resolve_job_project_dir(job):
-    assigned = (job.get('assigned_to') or '').strip()
-    if assigned in ('octave-gpu', 'cx1', 'cx2', 'cx3', 'cx4'):
-        candidate = REPO_ROOT / 'octave-gpu'
-        if candidate.is_dir():
-            return candidate
-
-    kernel = (job.get('kernel_type') or '').strip()
-    if kernel:
-        candidate = REPO_ROOT / kernel
-        if candidate.is_dir():
-            return candidate
-
-    return None
+    return resolve_factory_job_project_dir(job)
 
 
 def update_phase_context(project_dir, new_state):
@@ -268,6 +256,17 @@ def gate_process_job(job_id):
         if state == 'lint_pass':
             mem.update_job_state(jid, 'ready_to_ship', 'gate', 'lint passed')
             if project_dir: update_phase_context(project_dir, 'ready_to_ship')
+        shipping_plan = describe_job_shipping(job)
+        shipping_project = shipping_plan.get('project_dir')
+        if shipping_project:
+            project_dir = str(shipping_project)
+        if not shipping_plan.get('ok'):
+            mem.ensure_open_message('gate', f'Shipping blocked for {name}: invalid shipping plan',
+                body=shipping_plan['error'],
+                job_id=jid, message_type='blocker', priority='urgent')
+            print(f"  → shipping blocked: {shipping_plan['error']}")
+            mem.close()
+            return
         if project_dir:
             clean, dirty = ensure_repo_clean(project_dir)
             if not clean:
@@ -278,17 +277,10 @@ def gate_process_job(job_id):
                 mem.close()
                 return
         mem.update_job_state(jid, 'shipping', 'gate', 'shipping primitives')
-        results = mem.auto_ship_job(jid, shipped_by='gate')
-        shipped = [r for r in results if r.get('action') not in ('error', None)]
-        errors = [r for r in results if r.get('action') == 'error']
-        for r in shipped:
-            print(f"  SHIPPED: {r.get('shelf_path')} v{r.get('version')} hash={r.get('hash')}")
-        for r in errors:
-            print(f"  ERROR: {r.get('file')}: {r.get('error')}")
-        if shipped or not errors:
-            files = ', '.join(r.get('shelf_path','') for r in shipped) or '(infrastructure)'
+        if shipping_plan.get('mode') == 'metadata_only':
+            files = f"({shipping_plan.get('detail', 'metadata only')})"
             mem.update_job_state(jid, 'shipped', 'gate', f'shipped: {files}')
-            print(f'  → shipped')
+            print('  → shipped (metadata only)')
             if project_dir:
                 try:
                     commit_hash = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True, cwd=project_dir, check=True).stdout.strip()
@@ -299,6 +291,28 @@ def gate_process_job(job_id):
                 shipment_note = f'Shipped from {commit_hash}: {files}'
                 note_lines.append(shipment_note)
                 mem.update_job(jid, notes='\n'.join(line for line in note_lines if line), updated_by='gate')
+        else:
+            results = mem.auto_ship_job(jid, shipped_by='gate')
+            shipped = [r for r in results if r.get('action') not in ('error', None)]
+            errors = [r for r in results if r.get('action') == 'error']
+            for r in shipped:
+                print(f"  SHIPPED: {r.get('shelf_path')} v{r.get('version')} hash={r.get('hash')}")
+            for r in errors:
+                print(f"  ERROR: {r.get('file')}: {r.get('error')}")
+            if shipped or not errors:
+                files = ', '.join(r.get('shelf_path','') for r in shipped) or '(infrastructure)'
+                mem.update_job_state(jid, 'shipped', 'gate', f'shipped: {files}')
+                print(f'  → shipped')
+                if project_dir:
+                    try:
+                        commit_hash = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True, cwd=project_dir, check=True).stdout.strip()
+                    except subprocess.CalledProcessError:
+                        commit_hash = '<git_rev_parse_failed>'
+                    notes = (job.get('notes') or '').strip()
+                    note_lines = [notes] if notes else []
+                    shipment_note = f'Shipped from {commit_hash}: {files}'
+                    note_lines.append(shipment_note)
+                    mem.update_job(jid, notes='\n'.join(line for line in note_lines if line), updated_by='gate')
 
     # Reload state
     job = mem.get_job(jid)

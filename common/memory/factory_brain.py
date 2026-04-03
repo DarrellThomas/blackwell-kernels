@@ -205,6 +205,28 @@ MESSAGE_TYPES = {'halt', 'blocker', 'question', 'feedback', 'info', 'directive'}
 MESSAGE_STATUSES = {'open', 'acknowledged', 'resolved'}
 MESSAGE_PRIORITIES = {'urgent', 'normal', 'low'}
 
+KERNEL_WORKTREE_MAP = {
+    "lu": ("lu", "lu"),
+    "qr": ("qr", "qr"),
+    "gemm": ("gemm", "gemm"),
+    "linalg": ("linalg", "linalg"),
+    "numerical": ("numerical", "numerical"),
+    "spmv": ("spmv", "spmv"),
+    "attention": ("main", "attention"),
+    "cuquantum": ("cuquantum", "cuquantum"),
+    "rmsnorm": ("rmsnorm", "rmsnorm"),
+    "dotproduct": ("dotproduct", "dotproduct"),
+    "fused_mlp": ("fused-mlp", "fused-mlp"),
+    "chess_training": ("chess-training", "chess-training"),
+}
+
+OCTAVE_GPU_ASSIGNEES = {'octave-gpu', 'cx1', 'cx2', 'cx3', 'cx4'}
+KNOWN_REPO_ROOTS = (
+    "common",
+    "octave-gpu",
+    *dict.fromkeys(worktree for worktree, _ in KERNEL_WORKTREE_MAP.values()),
+)
+
 
 def _phase_index(phase: str) -> int:
     return PHASE_ORDER.index(phase)
@@ -242,6 +264,176 @@ def validate_transition(from_state: str, to_state: str) -> tuple:
 
     # Everything before shipped: move freely
     return True, ""
+
+
+def get_kernel_worktree_info(kernel_type: str):
+    return KERNEL_WORKTREE_MAP.get((kernel_type or "").strip())
+
+
+def _repo_root_for_path(path: Path) -> Optional[Path]:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
+    for repo_name in KNOWN_REPO_ROOTS:
+        candidate = BWK_ROOT / repo_name
+        try:
+            resolved.relative_to(candidate)
+            return candidate
+        except ValueError:
+            continue
+    return None
+
+
+def resolve_job_source_path(job) -> Optional[Path]:
+    source_file = (job.get("source_file") or "").strip()
+    if not source_file:
+        return None
+
+    raw = Path(source_file).expanduser()
+    candidates = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        info = get_kernel_worktree_info(job.get("kernel_type", ""))
+        if info:
+            candidates.append(BWK_ROOT / info[0] / raw)
+        candidates.append(BWK_ROOT / raw)
+        assigned = (job.get("assigned_to") or "").strip()
+        if assigned in OCTAVE_GPU_ASSIGNEES:
+            candidates.append(BWK_ROOT / "octave-gpu" / raw)
+
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        if resolved.exists():
+            return resolved
+
+    if candidates:
+        try:
+            return candidates[0].resolve()
+        except OSError:
+            return candidates[0]
+    return None
+
+
+def resolve_job_project_dir(job) -> Optional[Path]:
+    source_path = resolve_job_source_path(job)
+    if source_path is not None:
+        repo_root = _repo_root_for_path(source_path)
+        if repo_root and repo_root.is_dir():
+            return repo_root
+
+    assigned = (job.get("assigned_to") or "").strip()
+    if assigned in OCTAVE_GPU_ASSIGNEES:
+        candidate = BWK_ROOT / "octave-gpu"
+        if candidate.is_dir():
+            return candidate
+
+    info = get_kernel_worktree_info(job.get("kernel_type", ""))
+    if info:
+        candidate = BWK_ROOT / info[0]
+        if candidate.is_dir():
+            return candidate
+
+    kernel = (job.get("kernel_type") or "").strip()
+    if kernel:
+        candidate = BWK_ROOT / kernel
+        if candidate.is_dir():
+            return candidate
+
+    return None
+
+
+def describe_job_shipping(job) -> dict:
+    job_type = (job.get("job_type") or "kernel").strip() or "kernel"
+    project_dir = resolve_job_project_dir(job)
+
+    if job_type != "kernel":
+        return {
+            "ok": True,
+            "mode": "metadata_only",
+            "detail": f"{job_type} job; ship via repo metadata only",
+            "project_dir": project_dir,
+        }
+
+    info = get_kernel_worktree_info(job.get("kernel_type", ""))
+    if not info:
+        return {
+            "ok": False,
+            "mode": "primitive",
+            "error": f"Kernel job requires a recognized kernel_type; got '{job.get('kernel_type', '')}'.",
+            "project_dir": project_dir,
+        }
+
+    worktree, shelf_subdir = info
+    kernel_root = BWK_ROOT / worktree
+    source_file = (job.get("source_file") or "").strip()
+    if not source_file:
+        return {
+            "ok": False,
+            "mode": "primitive",
+            "error": (
+                "Kernel primitive shipping now requires source_file. "
+                "Split Octave wrapper/integration work into an algorithm job, "
+                "and point the kernel job at exactly one .cu primitive source."
+            ),
+            "project_dir": project_dir or kernel_root,
+        }
+
+    source_path = resolve_job_source_path(job)
+    if source_path is None:
+        return {
+            "ok": False,
+            "mode": "primitive",
+            "error": f"Kernel source_file could not be resolved: {source_file}",
+            "project_dir": project_dir or kernel_root,
+        }
+
+    if not source_path.is_file():
+        return {
+            "ok": False,
+            "mode": "primitive",
+            "error": f"Kernel source_file does not exist: {source_path}",
+            "project_dir": project_dir or kernel_root,
+        }
+
+    if source_path.suffix != ".cu":
+        return {
+            "ok": False,
+            "mode": "primitive",
+            "error": f"Kernel source_file must point to one .cu primitive, not {source_path.name}",
+            "project_dir": project_dir or kernel_root,
+        }
+
+    try:
+        source_path.relative_to(kernel_root)
+    except ValueError:
+        return {
+            "ok": False,
+            "mode": "primitive",
+            "error": (
+                f"Kernel source_file must live under {kernel_root}. "
+                f"Got {source_path}. Split Octave wrapper work into a non-kernel job."
+            ),
+            "project_dir": project_dir or kernel_root,
+        }
+
+    return {
+        "ok": True,
+        "mode": "primitive",
+        "source_path": source_path,
+        "project_dir": kernel_root,
+        "shelf_subdir": shelf_subdir,
+        "detail": f"{shelf_subdir}/{source_path.name}",
+    }
 
 
 # Kernel type inference from filename prefixes
@@ -1183,11 +1375,7 @@ class ResearchMemory:
         return results
 
     def auto_ship_job(self, job_id: int, shipped_by: str = "watchdog") -> list:
-        """Ship kernel .cu file(s) for a job. Returns list of ship results.
-
-        If job.source_file is set, ships only that one file (1 job = 1 function).
-        If not set, ships all .cu files for the kernel_type (legacy monolith mode).
-        """
+        """Ship one kernel primitive for a job, or no-op for non-kernel jobs."""
         job = self.get_job(job_id)
         if not job:
             return []
@@ -1195,46 +1383,11 @@ class ResearchMemory:
         if not kernel:
             return []
 
-        # Map kernel_type to worktree path and shelf subdirectory
-        worktree_map = {
-            "lu": ("lu", "lu"),
-            "qr": ("qr", "qr"),
-            "gemm": ("gemm", "gemm"),
-            "linalg": ("linalg", "linalg"),
-            "numerical": ("numerical", "numerical"),
-            "spmv": ("spmv", "spmv"),
-            "attention": ("main", "attention"),
-            "cuquantum": ("cuquantum", "cuquantum"),
-            "rmsnorm": ("rmsnorm", "rmsnorm"),
-            "dotproduct": ("dotproduct", "dotproduct"),
-            "fused_mlp": ("fused-mlp", "fused-mlp"),
-            "chess_training": ("chess-training", "chess-training"),
-        }
-
-        info = worktree_map.get(kernel)
-        if not info:
-            return []
-
-        worktree, shelf_sub = info
-
-        # If source_file is set, ship only that one file (1 job = 1 function)
-        if job.get("source_file"):
-            source = Path(job["source_file"])
-            if not source.is_absolute():
-                source = BWK_ROOT / worktree / source
-            cu_files = [source] if source.is_file() else []
-        else:
-            # Legacy: ship all .cu files for this kernel_type
-            source_dir = BWK_ROOT / worktree / "csrc" / kernel.replace("_", "-")
-            if not source_dir.is_dir():
-                source_dir = BWK_ROOT / worktree / "csrc" / worktree
-            if not source_dir.is_dir():
-                source_dir = BWK_ROOT / worktree / "csrc"
-            cu_files = list(source_dir.glob("*_sm120*.cu")) if source_dir.is_dir() else []
-            if not cu_files:
-                cu_files = list(source_dir.glob("*.cu")) if source_dir.is_dir() else []
-
-        results = []
+        plan = describe_job_shipping(job)
+        if not plan.get("ok"):
+            return [{"action": "error", "error": plan["error"]}]
+        if plan.get("mode") != "primitive":
+            return [{"action": "noop", "detail": plan.get("detail", "non-kernel job")}]
 
         # Get vs_ref from worker_state
         vs_ref = None
@@ -1244,17 +1397,14 @@ class ResearchMemory:
         if row:
             vs_ref = row[0]
 
-        for cu in cu_files:
-            try:
-                result = self.ship_primitive(
-                    str(cu), shelf_subdir=shelf_sub,
-                    vs_ref=vs_ref, shipped_by=shipped_by
-                )
-                results.append(result)
-            except Exception as e:
-                results.append({"action": "error", "file": str(cu), "error": str(e)})
-
-        return results
+        try:
+            result = self.ship_primitive(
+                str(plan["source_path"]), shelf_subdir=plan["shelf_subdir"],
+                vs_ref=vs_ref, shipped_by=shipped_by
+            )
+            return [result]
+        except Exception as e:
+            return [{"action": "error", "file": str(plan["source_path"]), "error": str(e)}]
 
     def record_test_run(self, job_id: int, kernel_type: str, category: str, command: str, status: str, output: str = "") -> None:
         """Persist a gate/test run for compliance, edge, and stress suites."""
@@ -1360,6 +1510,8 @@ class ResearchMemory:
                    hardware_target="", retarget_policy="", reference_label="") -> int:
         if state not in ALL_JOB_STATES:
             raise ValueError(f"Unknown state '{state}'. Valid: {sorted(ALL_JOB_STATES)}")
+        if job_type not in JOB_TYPES:
+            raise ValueError(f"Unknown job type '{job_type}'. Valid: {sorted(JOB_TYPES)}")
         if factory_mode and factory_mode not in FACTORY_MODES:
             raise ValueError(f"Unknown factory mode '{factory_mode}'. Valid: {sorted(FACTORY_MODES)}")
         if optimization_scope and optimization_scope not in OPTIMIZATION_SCOPES:
@@ -1443,13 +1595,15 @@ class ResearchMemory:
     def update_job(self, job_id, updated_by="ops", **kwargs):
         allowed = {"title", "description", "priority", "assigned_to", "execution_lane", "vs_ref",
                     "target_vs_ref", "tags", "notes", "kernel_type", "spec",
-                    "source_file", "factory_mode", "objective_vector",
+                    "source_file", "factory_mode", "objective_vector", "job_type",
                     "acceptance_gates", "keep_rule", "benchmark_set",
                     "failure_budget", "crossover_policy", "optimization_scope",
                     "hardware_target", "retarget_policy", "reference_label"}
         updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
         if not updates:
             return self.get_job(job_id)
+        if "job_type" in updates and updates["job_type"] and updates["job_type"] not in JOB_TYPES:
+            raise ValueError(f"Unknown job type '{updates['job_type']}'. Valid: {sorted(JOB_TYPES)}")
         if "factory_mode" in updates and updates["factory_mode"] and updates["factory_mode"] not in FACTORY_MODES:
             raise ValueError(f"Unknown factory mode '{updates['factory_mode']}'. Valid: {sorted(FACTORY_MODES)}")
         if "optimization_scope" in updates and updates["optimization_scope"] and updates["optimization_scope"] not in OPTIMIZATION_SCOPES:
@@ -3822,13 +3976,13 @@ def main():
     p_jobs.add_argument("--lane", dest="execution_lane", help="Filter by execution lane", choices=sorted(EXECUTION_LANES))
     p_jc = sub.add_parser("job-create", help="Create a new job")
     p_jc.add_argument("name"); p_jc.add_argument("title")
-    p_jc.add_argument("--description", default=""); p_jc.add_argument("--lane", dest="execution_lane", default="", choices=[''] + sorted(EXECUTION_LANES)); p_jc.add_argument("--type", default="kernel", dest="job_type")
+    p_jc.add_argument("--description", default=""); p_jc.add_argument("--lane", dest="execution_lane", default="", choices=[''] + sorted(EXECUTION_LANES)); p_jc.add_argument("--type", default="kernel", dest="job_type", choices=sorted(JOB_TYPES))
     p_jc.add_argument("--kernel", default=""); p_jc.add_argument("--parent", type=int, default=None)
     p_jc.add_argument("--state", default="wishlist"); p_jc.add_argument("--priority", default="3")
     p_jc.add_argument("--assigned", default=""); p_jc.add_argument("--target", type=float, default=1.0)
     p_jc.add_argument("--tags", default=""); p_jc.add_argument("--by", default="ops")
     p_jc.add_argument("--notes", default="")
-    p_jc.add_argument("--source-file", default="", dest="source_file", help="Path to the .cu file (1 job = 1 file)")
+    p_jc.add_argument("--source-file", default="", dest="source_file", help="Primary source file. Required for kernel primitive shipping.")
     p_jc.add_argument("--factory-mode", default="", choices=sorted(FACTORY_MODES))
     p_jc.add_argument("--objective-vector", default="")
     p_jc.add_argument("--acceptance-gates", default="")
@@ -3844,7 +3998,9 @@ def main():
     p_ju.add_argument("id", type=int); p_ju.add_argument("--state"); p_ju.add_argument("--title")
     p_ju.add_argument("--description"); p_ju.add_argument("--priority"); p_ju.add_argument("--assigned")
     p_ju.add_argument("--lane", dest="execution_lane", choices=sorted(EXECUTION_LANES))
+    p_ju.add_argument("--type", dest="job_type", choices=sorted(JOB_TYPES))
     p_ju.add_argument("--notes"); p_ju.add_argument("--tags"); p_ju.add_argument("--spec")
+    p_ju.add_argument("--source-file", dest="source_file")
     p_ju.add_argument("--factory-mode", choices=sorted(FACTORY_MODES))
     p_ju.add_argument("--objective-vector")
     p_ju.add_argument("--acceptance-gates")
@@ -4122,6 +4278,7 @@ def main():
             else:
                 result = mem.update_job(args.id, updated_by=args.by, title=args.title, description=args.description,
                     priority=args.priority, assigned_to=args.assigned, execution_lane=args.execution_lane, notes=args.notes, tags=args.tags,
+                    job_type=args.job_type, source_file=args.source_file,
                     spec=args.spec, factory_mode=args.factory_mode, objective_vector=args.objective_vector,
                     acceptance_gates=args.acceptance_gates, keep_rule=args.keep_rule,
                     benchmark_set=args.benchmark_set, failure_budget=args.failure_budget,
@@ -4143,7 +4300,9 @@ def main():
         ver_s = f"v{ver:.1f}" if ver > 0 else "unshipped"
         print(f"Job #{job['id']}: {job['title']}")
         print(f"  State: {job['state']} [{job['phase']}] | Version: {ver_s}")
-        print(f"  Priority: {job['priority']} | Kernel: {job['kernel_type'] or '-'} | Assigned: {job['assigned_to'] or '-'} | Lane: {job.get('execution_lane') or '-'}")
+        print(f"  Type: {job.get('job_type') or '-'} | Priority: {job['priority']} | Kernel: {job['kernel_type'] or '-'} | Assigned: {job['assigned_to'] or '-'} | Lane: {job.get('execution_lane') or '-'}")
+        if job.get('source_file'):
+            print(f"  Source File: {job['source_file']}")
         if job.get('factory_mode'):
             print(f"  Factory Mode: {job['factory_mode']}")
         if job.get('optimization_scope'):
