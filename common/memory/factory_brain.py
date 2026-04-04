@@ -352,6 +352,77 @@ def resolve_job_project_dir(job) -> Optional[Path]:
     return None
 
 
+
+
+def _normalize_handoff_subject(subject: str) -> str:
+    value = (subject or "").strip().lower()
+    if not value:
+        return ""
+    if value == "check my work":
+        return "check_my_work"
+    if value == "done" or "ready for handoff" in value:
+        return "done"
+    return ""
+
+
+def _normalize_worker_task_signal(task: str) -> str:
+    value = (task or "").strip().lower()
+    if not value:
+        return ""
+    if value.startswith("problem:"):
+        return "problem"
+    if value.startswith("check my work:"):
+        return "check_my_work"
+    if value.startswith("done:"):
+        return "done"
+    return ""
+
+
+def detect_worker_job_signal(mem, worker: str, job_id: int | None, worker_state: dict | None = None) -> str:
+    if job_id is None:
+        return "none"
+
+    open_rows = mem.get_messages(status='open', job_id=job_id, from_agent=worker)
+    for row in open_rows:
+        if (row.get('message_type') or '').strip() in ('blocker', 'question'):
+            return 'problem'
+
+    for row in open_rows:
+        signal = _normalize_handoff_subject(row.get('subject') or '')
+        if signal:
+            return signal
+
+    task_signal = _normalize_worker_task_signal((worker_state or {}).get('current_task', ''))
+    return task_signal or 'none'
+
+
+def get_active_worker_jobs(mem, worker: str, exclude_done_handoffs: bool = False) -> list[dict]:
+    terminal = {'shipped', 'converged', 'parked', 'abandoned'}
+    rows = [
+        j for j in mem.get_jobs(execution_lane='active', assigned_to=worker)
+        if j['state'] not in terminal
+    ]
+    rows.sort(key=lambda j: (
+        int(j['priority']) if str(j.get('priority', '')).isdigit() else 99,
+        j.get('updated_at') or '',
+        j.get('id') or 0,
+    ))
+    if not exclude_done_handoffs:
+        return rows
+
+    worker_row = mem.conn.execute(
+        "SELECT kernel_type, job_id, process_state, current_task FROM worker_state WHERE kernel_type = ?",
+        (worker,),
+    ).fetchone()
+    worker_state = dict(worker_row) if worker_row else {}
+    filtered = []
+    for job in rows:
+        if detect_worker_job_signal(mem, worker, job.get('id'), worker_state=worker_state) == 'done':
+            continue
+        filtered.append(job)
+    return filtered
+
+
 def describe_job_shipping(job) -> dict:
     job_type = (job.get("job_type") or "kernel").strip() or "kernel"
     project_dir = resolve_job_project_dir(job)

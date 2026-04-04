@@ -14,11 +14,11 @@ get_job_state() {
     python3 - "$worker_or_kernel" <<'PY' 2>/dev/null
 import os, sys
 sys.path.insert(0, os.environ['COMMON_DIR'] + '/memory')
-from factory_brain import ResearchMemory
+from factory_brain import ResearchMemory, get_active_worker_jobs
 key = sys.argv[1]
 terminal = {'shipped', 'converged', 'parked', 'abandoned'}
 mem = ResearchMemory()
-rows = [j for j in mem.get_jobs(execution_lane='active', assigned_to=key) if j['state'] not in terminal]
+rows = get_active_worker_jobs(mem, key, exclude_done_handoffs=True)
 if not rows:
     rows = [j for j in mem.get_jobs(kernel_type=key) if j['state'] not in terminal]
 rows.sort(key=lambda j: (int(j['priority']) if str(j['priority']).isdigit() else 99, j['updated_at'], j['id']))
@@ -33,7 +33,7 @@ get_worker_completion_context() {
     python3 - "$worker" <<'PY' 2>/dev/null
 import os, sys
 sys.path.insert(0, os.environ['COMMON_DIR'] + '/memory')
-from factory_brain import ResearchMemory
+from factory_brain import ResearchMemory, get_active_worker_jobs
 worker = sys.argv[1]
 terminal = {'shipped', 'converged', 'parked', 'abandoned'}
 mem = ResearchMemory()
@@ -41,7 +41,7 @@ row = mem.conn.execute(
     "SELECT process_state, job_id FROM worker_state WHERE kernel_type = ?",
     (worker,),
 ).fetchone()
-rows = [j for j in mem.get_jobs(execution_lane='active', assigned_to=worker) if j['state'] not in terminal]
+rows = get_active_worker_jobs(mem, worker, exclude_done_handoffs=True)
 rows.sort(key=lambda j: (int(j['priority']) if str(j['priority']).isdigit() else 99, j['updated_at'], j['id']))
 active_job = rows[0] if rows else None
 print((row['process_state'] if row else '').strip())
@@ -57,7 +57,7 @@ get_experiment_count() {
     count=$(python3 - <<PY 2>/dev/null || true
 import os, sys
 sys.path.insert(0, os.environ['COMMON_DIR'] + '/memory')
-from factory_brain import ResearchMemory
+from factory_brain import ResearchMemory, get_active_worker_jobs
 mem = ResearchMemory()
 try:
     row = mem.conn.execute(
@@ -85,12 +85,17 @@ staff_has_open_work() {
     python3 - <<PY
 import os, sys
 sys.path.insert(0, os.environ['COMMON_DIR'] + '/memory')
-from factory_brain import ResearchMemory
+from factory_brain import ResearchMemory, get_active_worker_jobs
 mem = ResearchMemory()
 rows = mem.get_messages(status='open', to_agent=${agent@Q}, message_type='research_request')
 print('1' if rows else '0')
 mem.close()
 PY
+}
+
+consume_worker_handoff() {
+    local worker="$1" worktree_path="$2"
+    python3 "$COMMON_DIR/scripts/watchdog_scheduler.py" --consume-worker-handoff "$worker" --worktree "$worktree_path" 2>/dev/null
 }
 
 expand_resume_cmd() {
@@ -105,13 +110,12 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.environ['COMMON_DIR'] + '/memory')
-from factory_brain import ResearchMemory
+from factory_brain import ResearchMemory, get_active_worker_jobs
 
 worker = sys.argv[1]
 terminal = {'shipped', 'converged', 'parked', 'abandoned'}
 mem = ResearchMemory()
-rows = mem.get_jobs(execution_lane='active', assigned_to=worker)
-rows = [j for j in rows if j['state'] not in terminal]
+rows = get_active_worker_jobs(mem, worker, exclude_done_handoffs=True)
 rows.sort(key=lambda j: (int(j['priority']) if str(j['priority']).isdigit() else 99, j['updated_at'], j['id']))
 job = rows[0] if rows else None
 if not job:
@@ -143,7 +147,7 @@ touch_tick() {
     python3 - <<PY >/dev/null 2>&1
 import os, sys
 sys.path.insert(0, os.environ['COMMON_DIR'] + '/memory')
-from factory_brain import ResearchMemory
+from factory_brain import ResearchMemory, get_active_worker_jobs
 mem = ResearchMemory()
 mem.touch_watchdog_state(${tick_name@Q}, status=${status@Q}, notes=${notes@Q})
 mem.close()
@@ -155,7 +159,7 @@ set_daemon_state() {
     if ! python3 - <<PY >/dev/null 2>&1
 import os, socket, sys
 sys.path.insert(0, os.environ['COMMON_DIR'] + '/memory')
-from factory_brain import ResearchMemory
+from factory_brain import ResearchMemory, get_active_worker_jobs
 mem = ResearchMemory()
 mem.set_watchdog_daemon_state(${status@Q}, notes=${notes@Q}, pid=os.getppid(), host=socket.gethostname())
 mem.close()
@@ -173,7 +177,7 @@ get_tick_epoch() {
     python3 - <<PY 2>/dev/null
 import os, sys, calendar
 sys.path.insert(0, os.environ['COMMON_DIR'] + '/memory')
-from factory_brain import ResearchMemory
+from factory_brain import ResearchMemory, get_active_worker_jobs
 mem = ResearchMemory()
 row = mem.get_watchdog_state(${tick_name@Q})
 mem.close()

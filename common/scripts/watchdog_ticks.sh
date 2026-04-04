@@ -6,11 +6,29 @@
 
 tick_short() {
     local now current new_iters reason wait_count idle_secs stall_secs
-    local completion_ctx=() process_state reported_job_id active_job_id
+    local completion_ctx=() handoff_ctx=() process_state reported_job_id active_job_id handoff_action handoff_detail
 
     for loop in "${LOOPS[@]}"; do
         IFS='|' read -r name session tsv resume_cmd launch_cmd cwd <<< "$loop"
         cwd="${cwd:-$REPO_ROOT/$name}"
+        cwd="$(prepare_worker_workspace "$name" "$cwd")"
+
+        mapfile -t handoff_ctx < <(consume_worker_handoff "$name" "$cwd")
+        handoff_action="${handoff_ctx[0]:-none}"
+        handoff_detail="${handoff_ctx[1]:-}"
+        if [[ "$handoff_action" == "reset" ]]; then
+            log_watchdog handoff "$name" "$handoff_detail"
+            restart_loop "$name" "$session" "$resume_cmd" "$launch_cmd" "$cwd"
+            LAST_IDLE_TIME[$name]=0
+            LAST_CHANGE_TIME[$name]=$(date +%s)
+            continue
+        fi
+        if [[ "$handoff_action" == "hold" ]]; then
+            log_watchdog hold "$name" "$handoff_detail"
+            LAST_IDLE_TIME[$name]=0
+            LAST_CHANGE_TIME[$name]=$(date +%s)
+            continue
+        fi
 
         mapfile -t completion_ctx < <(get_worker_completion_context "$name")
         process_state="${completion_ctx[0]:-}"
@@ -18,7 +36,7 @@ tick_short() {
         active_job_id="${completion_ctx[2]:-}"
         if [[ "$process_state" == "complete" ]]; then
             if [[ -n "$active_job_id" && "$reported_job_id" == "$active_job_id" ]]; then
-                log_watchdog hold "$name" "worker marked complete for active job #$active_job_id; waiting for manual lane movement"
+                log_watchdog hold "$name" "worker marked complete for active job #$active_job_id; waiting for explicit handoff signal"
                 continue
             fi
             reason="worker reported complete"

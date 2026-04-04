@@ -51,13 +51,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.environ['COMMON_DIR'] + '/memory')
-from factory_brain import ResearchMemory, resolve_job_project_dir
+from factory_brain import ResearchMemory, get_active_worker_jobs, resolve_job_project_dir
 
 worker = sys.argv[1]
 fallback_cwd = sys.argv[2]
 terminal = {'shipped', 'converged', 'parked', 'abandoned'}
 mem = ResearchMemory()
-rows = [j for j in mem.get_jobs(execution_lane='active', assigned_to=worker) if j['state'] not in terminal]
+rows = get_active_worker_jobs(mem, worker, exclude_done_handoffs=True)
 rows.sort(key=lambda j: (int(j['priority']) if str(j['priority']).isdigit() else 99, j['updated_at'], j['id']))
 job = rows[0] if rows else None
 project_dir = None
