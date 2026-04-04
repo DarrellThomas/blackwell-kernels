@@ -10,6 +10,7 @@
 #
 # Modules (sourced below):
 #   watchdog_db.sh      — DB/state helpers (get_tick_epoch, touch_tick, etc.)
+#   watchdog_git.sh     — dedicated per-worker git worktrees
 #   watchdog_tmux.sh    — tmux/session helpers (classify_pane_state, etc.)
 #   watchdog_workers.sh — worker lifecycle (ensure_loop_session, restart_loop)
 #   watchdog_ticks.sh   — periodic ticks (tick_short, tick_medium, tick_long)
@@ -109,6 +110,7 @@ STAFF_LOOPS=(
 # --- Source helper modules ---
 _SCRIPTS_DIR="$(dirname "${BASH_SOURCE[0]}")"
 source "$_SCRIPTS_DIR/watchdog_db.sh"
+source "$_SCRIPTS_DIR/watchdog_git.sh"
 source "$_SCRIPTS_DIR/watchdog_tmux.sh"
 source "$_SCRIPTS_DIR/watchdog_workers.sh"
 source "$_SCRIPTS_DIR/watchdog_ticks.sh"

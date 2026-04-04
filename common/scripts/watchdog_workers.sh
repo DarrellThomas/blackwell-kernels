@@ -4,8 +4,8 @@
 # Sourced by watchdog.sh. Requires watchdog_db.sh and watchdog_tmux.sh sourced first.
 
 update_phase_context() {
-    local kernel="$1" state="$2"
-    local project_dir="$REPO_ROOT/$kernel"
+    local kernel="$1" state="$2" project_dir_override="${3:-}"
+    local project_dir="${project_dir_override:-$REPO_ROOT/$kernel}"
     local target="$project_dir/.claude/phase_context.md"
 
     local phase_file=""
@@ -32,6 +32,8 @@ update_phase_context() {
 
 ensure_loop_session() {
     local name="$1" session="$2" cwd="${3:-$REPO_ROOT/$name}" launch_cmd="${4:-}" resume_cmd="${5:-}"
+
+    cwd="$(prepare_worker_workspace "$name" "$cwd")"
 
     if is_session_alive "$session"; then
         return 0
@@ -77,10 +79,12 @@ restart_loop() {
 
     log_watchdog restart "$name" "restarting loop"
 
+    cwd="$(prepare_worker_workspace "$name" "$cwd")"
+
     local state
     state=$(get_job_state "$name")
     if [[ -n "$state" ]]; then
-        update_phase_context "$name" "$state"
+        update_phase_context "$name" "$state" "$cwd"
     fi
 
     if is_codex_launch_cmd "$launch_cmd"; then

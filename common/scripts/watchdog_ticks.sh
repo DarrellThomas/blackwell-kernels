@@ -6,10 +6,27 @@
 
 tick_short() {
     local now current new_iters reason wait_count idle_secs stall_secs
+    local completion_ctx=() process_state reported_job_id active_job_id
 
     for loop in "${LOOPS[@]}"; do
         IFS='|' read -r name session tsv resume_cmd launch_cmd cwd <<< "$loop"
         cwd="${cwd:-$REPO_ROOT/$name}"
+
+        mapfile -t completion_ctx < <(get_worker_completion_context "$name")
+        process_state="${completion_ctx[0]:-}"
+        reported_job_id="${completion_ctx[1]:-}"
+        active_job_id="${completion_ctx[2]:-}"
+        if [[ "$process_state" == "complete" ]]; then
+            if [[ -n "$active_job_id" && "$reported_job_id" == "$active_job_id" ]]; then
+                log_watchdog hold "$name" "worker marked complete for active job #$active_job_id; waiting for manual lane movement"
+                continue
+            fi
+            reason="worker reported complete"
+            restart_loop "$name" "$session" "$resume_cmd" "$launch_cmd" "$cwd"
+            LAST_IDLE_TIME[$name]=0
+            LAST_CHANGE_TIME[$name]=$(date +%s)
+            continue
+        fi
 
         ensure_loop_session "$name" "$session" "$cwd" "$launch_cmd" "$resume_cmd"
 
