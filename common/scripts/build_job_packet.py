@@ -13,11 +13,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from validate_job_spec import DEFAULT_SCHEMA_PATH as DEFAULT_JOB_SPEC_SCHEMA_PATH
+from validate_job_spec import validate_job_spec_document
+
 
 SCRIPT_PATH = Path(__file__).resolve()
 COMMON_DIR = SCRIPT_PATH.parent.parent
 BWK_ROOT = COMMON_DIR.parent
 DEFAULT_SCHEMA_PATH = COMMON_DIR / "docs" / "job_packets" / "job_packet_schema.json"
+DEFAULT_JOB_SPEC_VALIDATOR_PATH = COMMON_DIR / "scripts" / "validate_job_spec.py"
 DEFAULT_WORKTREE_ROOT = Path(
     os.environ.get("WATCHDOG_WORKTREE_ROOT", str(BWK_ROOT / "data" / "watchdog-worktrees"))
 )
@@ -143,22 +147,6 @@ def validate_document(document: dict[str, Any], schema: dict[str, Any]) -> tuple
     return issues, None
 
 
-def validate_repo_local_spec(job_doc: dict[str, Any], schema_doc: dict[str, Any]) -> list[str]:
-    issues, unavailable = validate_document(job_doc, schema_doc)
-    if unavailable:
-        return [unavailable]
-
-    weighted_mix = job_doc.get("contracts", {}).get("performance", {}).get("weighted_mix")
-    if isinstance(weighted_mix, dict) and weighted_mix:
-        total = sum(float(value) for value in weighted_mix.values())
-        if abs(total - 1.0) > 1e-9:
-            issues.append(
-                "path=contracts.performance.weighted_mix: values must sum to 1.0 "
-                f"but got {total:.12f}"
-            )
-    return issues
-
-
 def build_repo_local_spec(
     job: dict[str, Any] | None,
     shared_project_dir: Path | None,
@@ -181,14 +169,14 @@ def build_repo_local_spec(
     if not shared_job_json.exists():
         return base
 
-    shared_schema = shared_job_json.with_name("job_schema.json")
-    shared_validator = shared_job_json.with_name("validate_job.py")
+    shared_schema = DEFAULT_JOB_SPEC_SCHEMA_PATH
+    shared_validator = DEFAULT_JOB_SPEC_VALIDATOR_PATH
     job_json_path = rebase_into_worktree(shared_job_json, shared_repo_root, worktree_root)
-    schema_path = rebase_into_worktree(shared_schema, shared_repo_root, worktree_root)
-    validator_path = rebase_into_worktree(shared_validator, shared_repo_root, worktree_root)
+    schema_path = shared_schema.resolve()
+    validator_path = shared_validator.resolve()
 
     actual_job_json = job_json_path if job_json_path and job_json_path.exists() else shared_job_json
-    actual_schema = schema_path if schema_path and schema_path.exists() else shared_schema
+    actual_schema = schema_path if schema_path.exists() else shared_schema
 
     payload, payload_error = load_json_with_error(actual_job_json)
     if payload_error is not None:
@@ -228,7 +216,7 @@ def build_repo_local_spec(
             "document": payload,
         }
 
-    issues = validate_repo_local_spec(payload, schema_doc)
+    issues = validate_job_spec_document(payload, schema_doc)
     status = "valid"
     if issues:
         status = "validator_unavailable" if len(issues) == 1 and issues[0].startswith("missing dependency") else "invalid"
