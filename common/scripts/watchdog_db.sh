@@ -105,7 +105,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.environ['COMMON_DIR'] + '/memory')
-from factory_brain import ResearchMemory, resolve_job_project_dir
+from factory_brain import ResearchMemory
 
 worker = sys.argv[1]
 terminal = {'shipped', 'converged', 'parked', 'abandoned'}
@@ -119,33 +119,19 @@ if not job:
 else:
     root = os.environ.get('REPO_ROOT', '')
     common = os.environ.get('COMMON_DIR', root + '/common')
-    project_dir = resolve_job_project_dir(job)
-    structured_spec = None
-    if project_dir is not None:
-        candidate = Path(project_dir) / f"docs/Job{job['id']}" / f"job_{job['id']}.json"
-        if candidate.exists():
-            structured_spec = candidate
-    spec_clause = ''
-    if structured_spec is not None:
-        validator = structured_spec.with_name('validate_job.py')
-        schema = structured_spec.with_name('job_schema.json')
-        parts = [f"If structured spec files exist at {structured_spec}"]
-        if validator.exists() and schema.exists():
-            parts.append(f"validate them with python3 {validator} {structured_spec} {schema}")
-        parts.append("and treat that JSON packet as the authoritative bounded contract before editing")
-        spec_clause = '. '.join(parts) + '. '
+    packet_root = Path(os.environ.get('WATCHDOG_WORKTREE_ROOT', os.path.join(root, 'data', 'watchdog-worktrees')))
+    packet_path = packet_root / worker / os.environ.get('WATCHDOG_PACKET_NAME', 'job_packet.json')
     print(
         f"Resume in this dedicated watchdog worktree on active job #{job['id']}: {job['title']}. Assume zero prior model context. "
         f"This project is one subdirectory inside the shared {root} factory, but you are expected to stay inside this isolated git worktree rather than editing the shared checkout. "
         f"The factory database is external to the project tree at {common}/memory/research.db; do not search for a local project database. "
         f"Before substantial exploration, run python3 {common}/memory/factory_brain.py heartbeat {worker} --job {job['id']} --state working --task 'resuming active job and reading spec'. "
-        f"Then rebuild context only from python3 {common}/memory/factory_brain.py job-show {job['id']}, python3 {common}/memory/factory_brain.py messages --job {job['id']}, python3 {common}/memory/factory_brain.py experiment-summary --kernel {(job.get('kernel_type') or worker)} --recent 8, and the local files named by the spec. "
-        f"{spec_clause}"
-        f"Do not begin with generic codebase exploration. Do not rely on prior chat context. Make the smallest change needed for this job, refresh heartbeat during long work, and report status back to the DB. "
+        f"Then read the generated worker packet at {packet_path} first. It is the authoritative structured packet generated from the DB job, open messages, experiment summary, local file hints, and any repo-local structured spec. "
+        f"If that packet reports repo_local_spec.present=true with validation_status='valid', treat the validated repo-local spec as the bounded contract before editing. "
+        f"Use only the packet's refresh commands plus the local files it names; do not begin with generic codebase exploration. "
+        f"Do not rely on prior chat context. Make the smallest change needed for this job, refresh heartbeat during long work, and report status back to the DB. "
         f"Git discipline: commit only on this worker branch before handoff, never edit the shared repo root, and keep ownership to the files implied by the active job. "
-        f"When you are done and want the slot reset, create a commit, run python3 {common}/memory/factory_brain.py heartbeat {worker} --job {job['id']} --state complete --task 'done: <summary>; commit <hash>', and send python3 {common}/memory/factory_brain.py message-create --from {worker} --job {job['id']} --subject 'done' --body 'commit=<hash>; summary=<summary>' --type info. "
-        f"If you want review before the job moves, use the same complete heartbeat but send subject 'check my work' with message type feedback. "
-        f"If you have a problem, keep the heartbeat state as working with a brief task summary and open a blocker or question message instead of guessing. "
+        f"When you hand off, follow the packet protocol exactly and signal one of 'done', 'check my work', or 'problem'. "
         f"Use {common}/csrc and {common}/docs for the shared primitives library and reference material. Ping the researcher (tmux session 'researcher') or open a research request whenever you need additional context or hit 'stuck_needs_research'."
     )
 mem.close()

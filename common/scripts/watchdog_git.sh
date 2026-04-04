@@ -4,6 +4,7 @@
 # Sourced by watchdog.sh. Requires REPO_ROOT and COMMON_DIR exported.
 
 WATCHDOG_WORKTREE_ROOT="${WATCHDOG_WORKTREE_ROOT:-$REPO_ROOT/data/watchdog-worktrees}"
+WATCHDOG_PACKET_NAME="${WATCHDOG_PACKET_NAME:-job_packet.json}"
 
 sanitize_ref_component() {
     local raw="${1:-}"
@@ -12,6 +13,33 @@ sanitize_ref_component() {
     cleaned="$(printf '%s' "$cleaned" | sed 's/^-*//; s/-*$//')"
     [[ -n "$cleaned" ]] || cleaned="repo"
     printf '%s' "$cleaned"
+}
+
+worker_packet_path() {
+    local worker="$1"
+    printf '%s\n' "$WATCHDOG_WORKTREE_ROOT/$worker/$WATCHDOG_PACKET_NAME"
+}
+
+refresh_worker_packet() {
+    local worker="$1" worktree_path="$2" shared_repo_root="${3:-}" branch="${4:-}"
+    local packet_path
+    packet_path="$(worker_packet_path "$worker")"
+    mkdir -p "$(dirname "$packet_path")"
+
+    local build_cmd=(python3 "$COMMON_DIR/scripts/build_job_packet.py" --worker "$worker" --worktree "$worktree_path" --output "$packet_path")
+    if [[ -n "$shared_repo_root" ]]; then
+        build_cmd+=(--shared-repo-root "$shared_repo_root")
+    fi
+    if [[ -n "$branch" ]]; then
+        build_cmd+=(--branch "$branch")
+    fi
+
+    if ! "${build_cmd[@]}" >/dev/null; then
+        log_watchdog attention "$worker" "failed to refresh job packet at $packet_path"
+        return 1
+    fi
+
+    printf '%s\n' "$packet_path"
 }
 
 _worker_context_lines() {
@@ -72,6 +100,7 @@ prepare_worker_workspace() {
     repo_name="${ctx[5]:-$(basename "$repo_top")}"
 
     if ! git -C "$repo_top" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        refresh_worker_packet "$worker" "$project_dir" "$repo_top" >/dev/null 2>&1 || true
         printf '%s\n' "$project_dir"
         return 0
     fi
@@ -92,11 +121,13 @@ prepare_worker_workspace() {
             current_common="$(cd "$worktree_path" && readlink -f "$(git rev-parse --git-common-dir)")"
             current_branch="$(git -C "$worktree_path" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
             if [[ "$current_common" == "$desired_common" && "$current_branch" == "$branch" ]]; then
+                refresh_worker_packet "$worker" "$worktree_path" "$repo_top" "$branch" >/dev/null 2>&1 || true
                 printf '%s\n' "$worktree_path"
                 return 0
             fi
             if git -C "$worktree_path" status --porcelain | grep -q .; then
                 log_watchdog attention "$worker" "dedicated worktree $worktree_path is dirty; refusing automatic reset"
+                refresh_worker_packet "$worker" "$worktree_path" "$repo_top" "$current_branch" >/dev/null 2>&1 || true
                 printf '%s\n' "$worktree_path"
                 return 0
             fi
@@ -113,6 +144,7 @@ prepare_worker_workspace() {
     fi
 
     log_watchdog git "$worker" "workspace=$worktree_path repo=$repo_top branch=$branch job=${job_id:-idle}"
+    refresh_worker_packet "$worker" "$worktree_path" "$repo_top" "$branch" >/dev/null 2>&1 || true
     printf '%s\n' "$worktree_path"
 }
 
