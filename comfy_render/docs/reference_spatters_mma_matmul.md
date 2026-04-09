@@ -1,0 +1,1 @@
+../../common/docs/reference_spatters_mma_matmul.md

@@ -1,0 +1,1 @@
+../../common/docs/reference_mma_ptx_programming.md

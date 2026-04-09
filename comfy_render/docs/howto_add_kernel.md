@@ -1,0 +1,1 @@
+../../common/docs/howto_add_kernel.md
