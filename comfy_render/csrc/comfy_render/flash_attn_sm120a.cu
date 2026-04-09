@@ -20,6 +20,17 @@ constexpr int Br = 64;
 constexpr int Bc = 64;
 constexpr int WARP_SIZE = 32;
 
+// Pack two floats into a BF16x2 uint32 (for MMA A-fragment from registers)
+__device__ __forceinline__ uint32_t pack_bf16_pair(float a, float b) {
+    uint32_t r;
+    asm("{ .reg .b16 lo, hi;\n"
+        "  cvt.rn.bf16.f32 lo, %1;\n"
+        "  cvt.rn.bf16.f32 hi, %2;\n"
+        "  mov.b32 %0, {lo, hi}; }\n"
+        : "=r"(r) : "f"(a), "f"(b));
+    return r;
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // MMA kernel for D=64 with cp.async, single-buffer for occupancy
 // ═══════════════════════════════════════════════════════════════════════
@@ -56,12 +67,11 @@ flash_attn_mma_d64(
     const __nv_bfloat16* V_ptr = V + (size_t)bh * N * D;
     __nv_bfloat16*       O_ptr = O + (size_t)bh * N * D;
 
-    // Smem: Q[Br*S] + K/P[Bc*S] + V[Bc*S]  (P aliases K after S computation)
-    // 28 KB total → 3 blocks per SM (25% occupancy)
+    // Smem: Q[Br*S] + KV[Bc*S]  (K and V share buffer, loaded sequentially)
+    // P stays in registers → K/V can share. 18 KB → 5 blocks/SM (42% occ)
     extern __shared__ char smem[];
-    __nv_bfloat16* q_smem = reinterpret_cast<__nv_bfloat16*>(smem);
-    __nv_bfloat16* k_smem = q_smem + Br * STRIDE;
-    __nv_bfloat16* v_smem = k_smem + Bc * STRIDE;
+    __nv_bfloat16* q_smem  = reinterpret_cast<__nv_bfloat16*>(smem);
+    __nv_bfloat16* kv_smem = q_smem + Br * STRIDE;
 
     // ─── Load Q to smem ───────────────────────────────────────────────
     for (int idx = tid; idx < Br * STRIDE; idx += BLOCK) {
@@ -92,13 +102,12 @@ flash_attn_mma_d64(
     for (int kv_t = 0; kv_t < kv_end; kv_t++) {
         const int kv_start = kv_t * Bc;
 
-        // ─── Load K + V via cp.async ────────────────────────────────
+        // ─── Load K via cp.async into shared KV buffer ───────────────
         for (int ci = tid; ci < KV_CHUNKS; ci += BLOCK) {
             int row = ci / (D / 8);
             int col = (ci % (D / 8)) * 8;
             int gr = kv_start + row;
-            bk::cp_async_128_zfill(&k_smem[row * STRIDE + col], &K_ptr[gr * D + col], gr < N);
-            bk::cp_async_128_zfill(&v_smem[row * STRIDE + col], &V_ptr[gr * D + col], gr < N);
+            bk::cp_async_128_zfill(&kv_smem[row * STRIDE + col], &K_ptr[gr * D + col], gr < N);
         }
         bk::cp_async_commit();
         bk::cp_async_wait_all();
@@ -127,7 +136,7 @@ flash_attn_mma_d64(
                 {
                     int mat = (lane >> 3) & 1;
                     bk::ldmatrix_x2(b0, b1,
-                        &k_smem[(n * 8 + (lane & 7)) * STRIDE + k * 16 + mat * 8]);
+                        &kv_smem[(n * 8 + (lane & 7)) * STRIDE + k * 16 + mat * 8]);
                 }
                 bk::mma_m16n8k16_bf16_nv(
                     s_acc[n*4], s_acc[n*4+1], s_acc[n*4+2], s_acc[n*4+3],
@@ -178,7 +187,7 @@ flash_attn_mma_d64(
         l_a *= sc_a; l_b *= sc_b;
         m_a = m_new_a; m_b = m_new_b;
 
-        // exp + store P to k_smem (reuses K buffer) + accumulate l
+        // exp → P in registers + accumulate l
         float lt_a = 0.0f, lt_b = 0.0f;
         #pragma unroll
         for (int n = 0; n < N_TILES; n++) {
@@ -187,14 +196,9 @@ flash_attn_mma_d64(
             float p2 = (s_acc[n*4+2] > -FLT_MAX) ? expf(s_acc[n*4+2] - m_new_b) : 0.0f;
             float p3 = (s_acc[n*4+3] > -FLT_MAX) ? expf(s_acc[n*4+3] - m_new_b) : 0.0f;
             lt_a += p0 + p1; lt_b += p2 + p3;
-
-            int col0 = n * 8 + (lane % 4) * 2;
-            int ra = warp_id * WARP_ROWS + mma_row_a;
-            int rb = warp_id * WARP_ROWS + mma_row_b;
-            k_smem[ra * STRIDE + col0]     = __float2bfloat16(p0);
-            k_smem[ra * STRIDE + col0 + 1] = __float2bfloat16(p1);
-            k_smem[rb * STRIDE + col0]     = __float2bfloat16(p2);
-            k_smem[rb * STRIDE + col0 + 1] = __float2bfloat16(p3);
+            // Reuse s_acc to hold P values for register-level A-fragment packing
+            s_acc[n*4]   = p0; s_acc[n*4+1] = p1;
+            s_acc[n*4+2] = p2; s_acc[n*4+3] = p3;
         }
 
         #pragma unroll
@@ -203,20 +207,26 @@ flash_attn_mma_d64(
             lt_b += __shfl_xor_sync(0xffffffff, lt_b, d);
         }
         l_a += lt_a; l_b += lt_b;
+
+        // ─── Load V via cp.async into shared KV buffer (reuse) ──────
+        for (int ci = tid; ci < KV_CHUNKS; ci += BLOCK) {
+            int row = ci / (D / 8);
+            int col = (ci % (D / 8)) * 8;
+            int gr = kv_start + row;
+            bk::cp_async_128_zfill(&kv_smem[row * STRIDE + col], &V_ptr[gr * D + col], gr < N);
+        }
+        bk::cp_async_commit();
+        bk::cp_async_wait_all();
         __syncthreads();
 
-        // ─── O += P @ V via MMA ─────────────────────────────────────
+        // ─── O += P @ V via MMA (P from registers, V from smem) ────
         #pragma unroll
         for (int k = 0; k < K_STEPS; k++) {
-            uint32_t pa0, pa1, pa2, pa3;
-            {
-                int sub = lane / 8;
-                int sub_row = lane % 8;
-                int row = warp_id * WARP_ROWS + (sub < 2 ? sub_row : 8 + sub_row);
-                int col = k * 16 + (sub % 2) * 8;
-                bk::ldmatrix_x4_mma(pa0, pa1, pa2, pa3,
-                    &k_smem[row * STRIDE + col]);
-            }
+            int nt0 = k * 2, nt1 = k * 2 + 1;
+            uint32_t pa0 = pack_bf16_pair(s_acc[nt0*4],   s_acc[nt0*4+1]);
+            uint32_t pa1 = pack_bf16_pair(s_acc[nt0*4+2], s_acc[nt0*4+3]);
+            uint32_t pa2 = pack_bf16_pair(s_acc[nt1*4],   s_acc[nt1*4+1]);
+            uint32_t pa3 = pack_bf16_pair(s_acc[nt1*4+2], s_acc[nt1*4+3]);
 
             #pragma unroll
             for (int n = 0; n < N_TILES; n++) {
@@ -224,7 +234,7 @@ flash_attn_mma_d64(
                 {
                     int mat = (lane >> 3) & 1;
                     bk::ldmatrix_x2_trans(vb0, vb1,
-                        &v_smem[(k * 16 + mat * 8 + (lane & 7)) * STRIDE + n * 8]);
+                        &kv_smem[(k * 16 + mat * 8 + (lane & 7)) * STRIDE + n * 8]);
                 }
                 bk::mma_m16n8k16_bf16_nv(
                     o_acc[n*4], o_acc[n*4+1], o_acc[n*4+2], o_acc[n*4+3],
@@ -354,7 +364,7 @@ torch::Tensor flash_attn_forward(
 
     constexpr int PAD=8;
     if(D==64){
-        int sm=(Br+2*Bc)*(64+PAD)*sizeof(__nv_bfloat16); // Q + K/P + V
+        int sm=(Br+Bc)*(64+PAD)*sizeof(__nv_bfloat16); // Q + KV shared
         auto fn=causal?flash_attn_mma_d64<true>:flash_attn_mma_d64<false>;
         fn<<<grid,128,sm>>>(d.q,d.k,d.v,d.o,N,sc);
     } else {
