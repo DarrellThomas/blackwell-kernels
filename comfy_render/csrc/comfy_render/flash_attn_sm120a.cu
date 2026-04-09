@@ -20,50 +20,8 @@ constexpr int Br = 64;
 constexpr int Bc = 64;
 constexpr int WARP_SIZE = 32;
 
-// ─── Helper: pack two BF16 into uint32 for MMA B fragment ───────────
-__device__ __forceinline__ uint32_t pack_bf16x2(
-    const __nv_bfloat16* smem, int idx0, int idx1)
-{
-    uint16_t lo = *reinterpret_cast<const uint16_t*>(&smem[idx0]);
-    uint16_t hi = *reinterpret_cast<const uint16_t*>(&smem[idx1]);
-    return (uint32_t)lo | ((uint32_t)hi << 16);
-}
-
-// ─── Helper: load B fragment for K^T ─────────────────────────────────
-// B[k][n] = K[n][k]. K is row-major [Bc][D]: k consecutive in cols.
-__device__ __forceinline__ void load_b_frag_kt(
-    uint32_t &b0, uint32_t &b1,
-    const __nv_bfloat16* k_smem, int stride,
-    int n_base, int k_base, int lane)
-{
-    int k_t = (lane % 4) * 2;
-    int n_t = lane / 4;
-    int row = n_base + n_t;  // K row (n-dim)
-    int col = k_base + k_t;  // K col (k-dim)
-    b0 = pack_bf16x2(k_smem, row * stride + col, row * stride + col + 1);
-    b1 = pack_bf16x2(k_smem, row * stride + col + 8, row * stride + col + 9);
-}
-
-// ─── Helper: load B fragment for V ───────────────────────────────────
-// B[k][n] = V[k][n]. V is row-major [Bc][D]: n consecutive in cols,
-// but B fragment packs consecutive k (different rows, same col).
-__device__ __forceinline__ void load_b_frag_v(
-    uint32_t &b0, uint32_t &b1,
-    const __nv_bfloat16* v_smem, int stride,
-    int k_base, int n_base, int lane)
-{
-    int k_t = (lane % 4) * 2;
-    int n_t = lane / 4;
-    int row = k_base + k_t;  // V row (k-dim)
-    int col = n_base + n_t;  // V col (n-dim)
-    // b0 = {V[row, col], V[row+1, col]}
-    b0 = pack_bf16x2(v_smem, row * stride + col, (row + 1) * stride + col);
-    // b1 = {V[row+8, col], V[row+9, col]}
-    b1 = pack_bf16x2(v_smem, (row + 8) * stride + col, (row + 9) * stride + col);
-}
-
 // ═══════════════════════════════════════════════════════════════════════
-// MMA kernel for D=64 with cp.async
+// MMA kernel for D=64 with cp.async + double-buffer
 // ═══════════════════════════════════════════════════════════════════════
 template <bool CAUSAL>
 __global__ void __launch_bounds__(128)
@@ -76,7 +34,6 @@ flash_attn_mma_d64(
     const float scale
 ) {
     constexpr int D = 64;
-    constexpr int NUM_WARPS = 4;
     constexpr int BLOCK = 128;
     constexpr int PAD = 8;
     constexpr int STRIDE = D + PAD; // 72
@@ -84,6 +41,8 @@ flash_attn_mma_d64(
     constexpr int K_STEPS = 4;  // D/16
     constexpr int N_TILES = 8;  // Bc/8 = D/8
     constexpr int ACC = 32;     // N_TILES * 4
+    constexpr int KV_BUF = Bc * STRIDE;
+    constexpr int KV_CHUNKS = Bc * (D / 8); // 512 cp.async chunks per tile
 
     const int bh = blockIdx.x;
     const int q_start = blockIdx.y * Br;
@@ -98,38 +57,34 @@ flash_attn_mma_d64(
     const __nv_bfloat16* V_ptr = V + (size_t)bh * N * D;
     __nv_bfloat16*       O_ptr = O + (size_t)bh * N * D;
 
-    // Smem: Q[64][72] + K[64][72] + V[64][72] + P[64][72]
+    // Smem: Q[Br*S] + K/P[2*Bc*S] + V[2*Bc*S]  (P aliases K[cur_buf])
     extern __shared__ char smem[];
-    __nv_bfloat16* q_smem = reinterpret_cast<__nv_bfloat16*>(smem);
-    __nv_bfloat16* k_smem = q_smem + Br * STRIDE;
-    __nv_bfloat16* v_smem = k_smem + Bc * STRIDE;
-    __nv_bfloat16* p_smem = v_smem + Bc * STRIDE;
+    __nv_bfloat16* q_smem   = reinterpret_cast<__nv_bfloat16*>(smem);
+    __nv_bfloat16* kp_base  = q_smem + Br * STRIDE;
+    __nv_bfloat16* v_base   = kp_base + 2 * KV_BUF;
 
-    // ─── Load Q to smem via cp.async ─────────────────────────────────
-    for (int idx = tid; idx < Br * STRIDE; idx += BLOCK) {
-        int r = idx / STRIDE, c = idx % STRIDE;
-        int gr = q_start + r;
-        if (gr < N && c < D) {
-            bk::cp_async_128(&q_smem[r * STRIDE + (c & ~7)],
-                              &Q_ptr[gr * D + (c & ~7)]);
-            // Only issue one cp.async per 128-bit aligned chunk
-            // Skip if this thread's c is not chunk-aligned
-        }
-    }
-    // Actually, cp.async loads 16 bytes (8 BF16). Let me redo this properly.
-    // Each cp.async_128 copies 16 bytes. Total Q data: 64 * 64 * 2 = 8192 bytes.
-    // 8192 / 16 = 512 cp.async calls. With 128 threads: 4 calls per thread.
-    // Simpler: just use regular loads for Q (only loaded once).
-    // Reset and use simple loads:
-
-    // Actually, let me just do regular smem loads for simplicity.
-    // cp.async optimization can come later.
+    // ─── Load Q to smem ───────────────────────────────────────────────
     for (int idx = tid; idx < Br * STRIDE; idx += BLOCK) {
         int r = idx / STRIDE, c = idx % STRIDE;
         int gr = q_start + r;
         q_smem[idx] = (gr < N && c < D)
             ? Q_ptr[gr * D + c] : __float2bfloat16(0.0f);
     }
+
+    // ─── Prefetch first KV tile into buffer 0 ────────────────────────
+    {
+        __nv_bfloat16* kb = kp_base;
+        __nv_bfloat16* vb = v_base;
+        for (int ci = tid; ci < KV_CHUNKS; ci += BLOCK) {
+            int row = ci / (D / 8);
+            int col = (ci % (D / 8)) * 8;
+            int gr = row;
+            bk::cp_async_128_zfill(&kb[row * STRIDE + col], &K_ptr[gr * D + col], gr < N);
+            bk::cp_async_128_zfill(&vb[row * STRIDE + col], &V_ptr[gr * D + col], gr < N);
+        }
+        bk::cp_async_commit();
+    }
+    bk::cp_async_wait_all();
     __syncthreads();
 
     // ─── Accumulators ────────────────────────────────────────────────
@@ -147,30 +102,37 @@ flash_attn_mma_d64(
 
     const int kv_tiles = (N + Bc - 1) / Bc;
     const int kv_end = CAUSAL ? min(kv_tiles, (q_start + Br + Bc - 1) / Bc) : kv_tiles;
+    const int q_base = warp_id * WARP_ROWS;
 
     for (int kv_t = 0; kv_t < kv_end; kv_t++) {
         const int kv_start = kv_t * Bc;
+        const int buf = kv_t & 1;
+        __nv_bfloat16* k_smem = kp_base + buf * KV_BUF;
+        __nv_bfloat16* v_smem = v_base  + buf * KV_BUF;
 
-        // ─── Load K + V to smem ──────────────────────────────────────
-        for (int idx = tid; idx < Bc * STRIDE; idx += BLOCK) {
-            int r = idx / STRIDE, c = idx % STRIDE;
-            int gr = kv_start + r;
-            __nv_bfloat16 zero = __float2bfloat16(0.0f);
-            k_smem[idx] = (gr < N && c < D) ? K_ptr[gr * D + c] : zero;
-            v_smem[idx] = (gr < N && c < D) ? V_ptr[gr * D + c] : zero;
+        // ─── Prefetch next KV tile into opposite buffer ─────────────
+        if (kv_t + 1 < kv_end) {
+            const int nxt = (kv_t + 1) * Bc;
+            const int nb  = 1 - buf;
+            __nv_bfloat16* kb = kp_base + nb * KV_BUF;
+            __nv_bfloat16* vb = v_base  + nb * KV_BUF;
+            for (int ci = tid; ci < KV_CHUNKS; ci += BLOCK) {
+                int row = ci / (D / 8);
+                int col = (ci % (D / 8)) * 8;
+                int gr = nxt + row;
+                bk::cp_async_128_zfill(&kb[row * STRIDE + col], &K_ptr[gr * D + col], gr < N);
+                bk::cp_async_128_zfill(&vb[row * STRIDE + col], &V_ptr[gr * D + col], gr < N);
+            }
+            bk::cp_async_commit();
         }
-        __syncthreads();
 
         // ─── S = Q @ K^T via MMA ────────────────────────────────────
         float s_acc[ACC];
         #pragma unroll
         for (int i = 0; i < ACC; i++) s_acc[i] = 0.0f;
 
-        const int q_base = warp_id * WARP_ROWS;
-
         #pragma unroll
         for (int k = 0; k < K_STEPS; k++) {
-            // A fragment from Q
             uint32_t a0, a1, a2, a3;
             {
                 int sub = lane / 8;
@@ -183,12 +145,13 @@ flash_attn_mma_d64(
 
             #pragma unroll
             for (int n = 0; n < N_TILES; n++) {
-                // B fragment from K (K^T B-fragment)
                 uint32_t b0, b1;
-                load_b_frag_kt(b0, b1, k_smem, STRIDE,
-                               n * 8, k * 16, lane);
-
-                bk::mma_m16n8k16_bf16(
+                {
+                    int mat = (lane >> 3) & 1;
+                    bk::ldmatrix_x2(b0, b1,
+                        &k_smem[(n * 8 + (lane & 7)) * STRIDE + k * 16 + mat * 8]);
+                }
+                bk::mma_m16n8k16_bf16_nv(
                     s_acc[n*4], s_acc[n*4+1], s_acc[n*4+2], s_acc[n*4+3],
                     a0, a1, a2, a3, b0, b1,
                     s_acc[n*4], s_acc[n*4+1], s_acc[n*4+2], s_acc[n*4+3]);
@@ -218,7 +181,6 @@ flash_attn_mma_d64(
             rmax_b = fmaxf(rmax_b, fmaxf(s_acc[n*4+2], s_acc[n*4+3]));
         }
 
-        // Reduce max within 4-thread row group
         #pragma unroll
         for (int d = 1; d < 4; d <<= 1) {
             rmax_a = fmaxf(rmax_a, __shfl_xor_sync(0xffffffff, rmax_a, d));
@@ -238,7 +200,7 @@ flash_attn_mma_d64(
         l_a *= sc_a; l_b *= sc_b;
         m_a = m_new_a; m_b = m_new_b;
 
-        // exp + store P to smem + accumulate l
+        // exp + store P to k_smem (reuses K buffer) + accumulate l
         float lt_a = 0.0f, lt_b = 0.0f;
         #pragma unroll
         for (int n = 0; n < N_TILES; n++) {
@@ -251,10 +213,10 @@ flash_attn_mma_d64(
             int col0 = n * 8 + (lane % 4) * 2;
             int ra = warp_id * WARP_ROWS + mma_row_a;
             int rb = warp_id * WARP_ROWS + mma_row_b;
-            p_smem[ra * STRIDE + col0]     = __float2bfloat16(p0);
-            p_smem[ra * STRIDE + col0 + 1] = __float2bfloat16(p1);
-            p_smem[rb * STRIDE + col0]     = __float2bfloat16(p2);
-            p_smem[rb * STRIDE + col0 + 1] = __float2bfloat16(p3);
+            k_smem[ra * STRIDE + col0]     = __float2bfloat16(p0);
+            k_smem[ra * STRIDE + col0 + 1] = __float2bfloat16(p1);
+            k_smem[rb * STRIDE + col0]     = __float2bfloat16(p2);
+            k_smem[rb * STRIDE + col0 + 1] = __float2bfloat16(p3);
         }
 
         #pragma unroll
@@ -268,7 +230,6 @@ flash_attn_mma_d64(
         // ─── O += P @ V via MMA ─────────────────────────────────────
         #pragma unroll
         for (int k = 0; k < K_STEPS; k++) {
-            // A fragment from P
             uint32_t pa0, pa1, pa2, pa3;
             {
                 int sub = lane / 8;
@@ -276,24 +237,27 @@ flash_attn_mma_d64(
                 int row = warp_id * WARP_ROWS + (sub < 2 ? sub_row : 8 + sub_row);
                 int col = k * 16 + (sub % 2) * 8;
                 bk::ldmatrix_x4_mma(pa0, pa1, pa2, pa3,
-                    &p_smem[row * STRIDE + col]);
+                    &k_smem[row * STRIDE + col]);
             }
 
             #pragma unroll
             for (int n = 0; n < N_TILES; n++) {
-                // B fragment from V
-                // For O = P @ V: P[16, Bc=64] @ V[Bc=64, D=64]
-                // B[k][n] = V[k][n], V row-major [Bc][D]
-                // k-dim = Bc (k_step*16...), n-dim = D (n_tile*8...)
                 uint32_t vb0, vb1;
-                load_b_frag_v(vb0, vb1, v_smem, STRIDE,
-                              k * 16, n * 8, lane);
-
-                bk::mma_m16n8k16_bf16(
+                {
+                    int mat = (lane >> 3) & 1;
+                    bk::ldmatrix_x2_trans(vb0, vb1,
+                        &v_smem[(k * 16 + mat * 8 + (lane & 7)) * STRIDE + n * 8]);
+                }
+                bk::mma_m16n8k16_bf16_nv(
                     o_acc[n*4], o_acc[n*4+1], o_acc[n*4+2], o_acc[n*4+3],
                     pa0, pa1, pa2, pa3, vb0, vb1,
                     o_acc[n*4], o_acc[n*4+1], o_acc[n*4+2], o_acc[n*4+3]);
             }
+        }
+
+        // ─── Wait for prefetch + barrier ─────────────────────────────
+        if (kv_t + 1 < kv_end) {
+            bk::cp_async_wait_all();
         }
         __syncthreads();
     }
@@ -417,7 +381,7 @@ torch::Tensor flash_attn_forward(
 
     constexpr int PAD=8;
     if(D==64){
-        int sm=4*Br*(64+PAD)*sizeof(__nv_bfloat16); // Q+K+V+P
+        int sm=(Br+4*Bc)*(64+PAD)*sizeof(__nv_bfloat16); // Q + K/P×2 + V×2
         auto fn=causal?flash_attn_mma_d64<true>:flash_attn_mma_d64<false>;
         fn<<<grid,128,sm>>>(d.q,d.k,d.v,d.o,N,sc);
     } else {
