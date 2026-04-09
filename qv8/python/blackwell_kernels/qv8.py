@@ -5,11 +5,46 @@
 # Custom CUDA kernel wrapper + PyTorch reference + circuit generator.
 
 import math
+import os
 import torch
 import numpy as np
 
 N_QUBITS = 8
 STATE_SIZE = 1 << N_QUBITS  # 256
+
+_cuda_mod = None
+
+
+def _load_cuda_module():
+    """Load the CUDA extension, JIT-compiling if the pre-built .so is missing."""
+    global _cuda_mod
+    if _cuda_mod is not None:
+        return _cuda_mod
+    try:
+        from blackwell_kernels._C import qv8_simulate as _fn
+        import blackwell_kernels._C as mod
+        _cuda_mod = mod
+        return mod
+    except ImportError:
+        pass
+    # JIT compile from source
+    from torch.utils.cpp_extension import load
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(pkg_dir))
+    src = os.path.join(project_root, "csrc", "qv8", "qv8_sim_sm120.cu")
+    inc = os.path.join(project_root, "csrc", "common")
+    _cuda_mod = load(
+        name="qv8_cuda",
+        sources=[src],
+        extra_include_paths=[inc],
+        extra_cuda_cflags=[
+            "-O3", "--use_fast_math",
+            "-gencode", "arch=compute_120a,code=sm_120a",
+            "-std=c++17", "--expt-relaxed-constexpr", "-lineinfo",
+        ],
+        verbose=False,
+    )
+    return _cuda_mod
 
 
 def _random_haar_u4_batch(rng, count):
@@ -160,8 +195,8 @@ def qv8_simulate(gate_matrices, gate_qubits, num_circuits):
     Returns:
         probs: [C, 256] float32 tensor of output probabilities
     """
-    from blackwell_kernels._C import qv8_simulate as _qv8_simulate_cuda
-    return _qv8_simulate_cuda(gate_matrices, gate_qubits, num_circuits)
+    mod = _load_cuda_module()
+    return mod.qv8_simulate(gate_matrices, gate_qubits, num_circuits)
 
 
 def qv8_simulate_ref(gate_matrices, gate_qubits, num_circuits):
