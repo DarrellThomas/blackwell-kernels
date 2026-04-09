@@ -4,4 +4,6 @@
 
 __version__ = "0.1.0"
 
-from blackwell_kernels.qv8 import qv8_simulate, qv8_simulate_ref, generate_qv8_circuits
+from blackwell_kernels.qv8 import (
+    qv8_simulate, qv8_simulate_ref, generate_qv8_circuits, generate_qv8_circuits_gpu,
+)

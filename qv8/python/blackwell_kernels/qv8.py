@@ -12,23 +12,31 @@ N_QUBITS = 8
 STATE_SIZE = 1 << N_QUBITS  # 256
 
 
-def _random_su4(rng):
-    """Generate a random SU(4) matrix via QR decomposition of a random complex matrix."""
-    z = (rng.standard_normal((4, 4)) + 1j * rng.standard_normal((4, 4))) / math.sqrt(2)
+def _random_haar_u4_batch(rng, count):
+    """Generate *count* Haar-random U(4) matrices via batched QR.
+
+    Returns complex64 array of shape [count, 4, 4].
+    Uses batched np.linalg.qr — orders of magnitude faster than
+    looping with per-gate QR decompositions.
+
+    We produce U(4) (not SU(4)): the global phase from det != 1
+    has no effect on measurement probabilities, so the SU(4)
+    normalization is unnecessary for quantum volume evaluation.
+    """
+    z = (rng.standard_normal((count, 4, 4))
+         + 1j * rng.standard_normal((count, 4, 4))) / math.sqrt(2)
     q, r = np.linalg.qr(z)
-    d = np.diag(r)
-    ph = d / np.abs(d)
-    q = q @ np.diag(ph)
-    # Make it SU(4): det(q) should be 1
-    det = np.linalg.det(q)
-    q = q / (det ** 0.25)
+    # Haar phase correction: Q → Q * diag(d / |d|)
+    d = np.diagonal(r, axis1=-2, axis2=-1)          # [count, 4]
+    ph = d / np.abs(d)                               # unit-phase diag
+    q = q * ph[:, np.newaxis, :]                     # broadcast over rows
     return q.astype(np.complex64)
 
 
 def generate_qv8_circuits(num_circuits, num_layers=N_QUBITS, seed=42):
-    """Generate random QV-8 circuits.
+    """Generate random QV-8 circuits (batched, fast).
 
-    Each layer applies N_QUBITS/2 = 4 random SU(4) gates to random
+    Each layer applies N_QUBITS/2 = 4 random Haar-U(4) gates to random
     qubit pairs (a permutation of all 8 qubits, split into pairs).
 
     Returns:
@@ -39,30 +47,105 @@ def generate_qv8_circuits(num_circuits, num_layers=N_QUBITS, seed=42):
     rng = np.random.default_rng(seed)
     num_gates = num_layers * (N_QUBITS // 2)
 
-    all_matrices = np.zeros((num_circuits, num_gates, 4, 4, 2), dtype=np.float32)
-    all_qubits = np.zeros((num_circuits, num_gates, 2), dtype=np.int32)
-
-    # Generate qubit permutations per layer (shared across all circuits).
-    # Only the SU(4) matrices differ per circuit. This is standard for
-    # batched QV simulation and enables vectorized reference execution.
+    # Qubit permutations per layer (shared across circuits, standard for QV)
     layer_perms = [rng.permutation(N_QUBITS) for _ in range(num_layers)]
 
-    for c in range(num_circuits):
-        g_idx = 0
-        for layer in range(num_layers):
-            perm = layer_perms[layer]
-            for pair in range(N_QUBITS // 2):
-                q0 = int(perm[2 * pair])
-                q1 = int(perm[2 * pair + 1])
-                u = _random_su4(rng)
-                all_matrices[c, g_idx, :, :, 0] = u.real
-                all_matrices[c, g_idx, :, :, 1] = u.imag
-                all_qubits[c, g_idx, 0] = q0
-                all_qubits[c, g_idx, 1] = q1
-                g_idx += 1
+    # Batched Haar-random U(4) generation — single call replaces C*G python loops
+    total = num_circuits * num_gates
+    u_batch = _random_haar_u4_batch(rng, total)       # [total, 4, 4] complex64
+    u_batch = u_batch.reshape(num_circuits, num_gates, 4, 4)
 
-    gate_matrices = torch.from_numpy(all_matrices)
-    gate_qubits = torch.from_numpy(all_qubits)
+    # Pack real/imag into [C, G, 4, 4, 2]
+    all_matrices = np.stack([u_batch.real, u_batch.imag], axis=-1)
+
+    # Build qubit index array
+    all_qubits = np.zeros((num_circuits, num_gates, 2), dtype=np.int32)
+    g_idx = 0
+    for layer in range(num_layers):
+        perm = layer_perms[layer]
+        for pair in range(N_QUBITS // 2):
+            all_qubits[:, g_idx, 0] = int(perm[2 * pair])
+            all_qubits[:, g_idx, 1] = int(perm[2 * pair + 1])
+            g_idx += 1
+
+    gate_matrices = torch.from_numpy(np.ascontiguousarray(all_matrices))
+    gate_qubits = torch.from_numpy(np.ascontiguousarray(all_qubits))
+    return gate_matrices, gate_qubits, num_gates
+
+
+def _gram_schmidt_u4_gpu(v_r, v_i):
+    """Batched Gram-Schmidt on 4 complex vectors of length 4, using real arithmetic.
+
+    Args:
+        v_r: [N, 4, 4] float32 CUDA — real parts (v_r[:, col, row])
+        v_i: [N, 4, 4] float32 CUDA — imag parts
+
+    Returns:
+        q_r, q_i: [N, 4, 4] float32 CUDA — orthonormalized columns
+    """
+    q_r = torch.empty_like(v_r)
+    q_i = torch.empty_like(v_i)
+    for j in range(4):
+        # Start with column j
+        u_r = v_r[:, j]   # [N, 4]
+        u_i = v_i[:, j]
+        # Subtract projections onto previous orthonormal columns
+        for k in range(j):
+            qk_r = q_r[:, k]  # [N, 4]
+            qk_i = q_i[:, k]
+            # Complex inner product <q_k, u> = sum(qk_r*u_r + qk_i*u_i) + i*sum(qk_r*u_i - qk_i*u_r)
+            dot_r = (qk_r * u_r + qk_i * u_i).sum(-1, keepdim=True)  # [N, 1]
+            dot_i = (qk_r * u_i - qk_i * u_r).sum(-1, keepdim=True)
+            # u -= dot * q_k  (complex multiply: (a+ib)(c+id) = (ac-bd)+i(ad+bc))
+            u_r = u_r - (dot_r * qk_r - dot_i * qk_i)
+            u_i = u_i - (dot_r * qk_i + dot_i * qk_r)
+        # Normalize
+        norm = (u_r * u_r + u_i * u_i).sum(-1, keepdim=True).sqrt()  # [N, 1]
+        q_r[:, j] = u_r / norm
+        q_i[:, j] = u_i / norm
+    return q_r, q_i
+
+
+def generate_qv8_circuits_gpu(num_circuits, num_layers=N_QUBITS, seed=42, device='cuda'):
+    """Generate random QV-8 circuits entirely on GPU.
+
+    Uses Gram-Schmidt orthogonalization of random Gaussian vectors in real
+    arithmetic — avoids CPU bottleneck and broken PyTorch complex CUDA JIT.
+
+    Returns:
+        gate_matrices: [C, G, 4, 4, 2] float32 CUDA tensor
+        gate_qubits:   [C, G, 2] int32 CUDA tensor
+        num_gates_per_circuit: int
+    """
+    num_gates = num_layers * (N_QUBITS // 2)
+    total = num_circuits * num_gates
+
+    # Generate random complex Gaussian vectors on GPU
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    v_r = torch.randn(total, 4, 4, device=device, generator=gen)
+    v_i = torch.randn(total, 4, 4, device=device, generator=gen)
+
+    # Gram-Schmidt → Haar-random U(4) in real arithmetic
+    q_r, q_i = _gram_schmidt_u4_gpu(v_r, v_i)
+
+    # Reshape and pack: columns are stored as q[:, col, row], need [C, G, row, col, 2]
+    q_r = q_r.reshape(num_circuits, num_gates, 4, 4).permute(0, 1, 3, 2)
+    q_i = q_i.reshape(num_circuits, num_gates, 4, 4).permute(0, 1, 3, 2)
+    gate_matrices = torch.stack([q_r, q_i], dim=-1).contiguous()
+
+    # Qubit permutations (tiny — CPU is fine)
+    rng = np.random.default_rng(seed)
+    layer_perms = [rng.permutation(N_QUBITS) for _ in range(num_layers)]
+    gate_qubits = torch.zeros(num_circuits, num_gates, 2, dtype=torch.int32, device=device)
+    g_idx = 0
+    for layer in range(num_layers):
+        perm = layer_perms[layer]
+        for pair in range(N_QUBITS // 2):
+            gate_qubits[:, g_idx, 0] = int(perm[2 * pair])
+            gate_qubits[:, g_idx, 1] = int(perm[2 * pair + 1])
+            g_idx += 1
+
     return gate_matrices, gate_qubits, num_gates
 
 

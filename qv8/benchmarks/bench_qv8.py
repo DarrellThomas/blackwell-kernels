@@ -10,7 +10,9 @@ import time
 import torch
 
 sys.path.insert(0, "python")
-from blackwell_kernels.qv8 import qv8_simulate, qv8_simulate_ref, generate_qv8_circuits
+from blackwell_kernels.qv8 import (
+    qv8_simulate, qv8_simulate_ref, generate_qv8_circuits, generate_qv8_circuits_gpu,
+)
 
 device = "cuda"
 
@@ -68,6 +70,16 @@ def main():
         r_ms = bench(lambda: qv8_simulate_ref(gm_td, gq_td, c_test), warmup=5, timed=50)
         ratio = r_ms / c_ms
         print(f"{f'{c_test} circuits':<30} {c_ms:<15.3f} {r_ms:<15.3f} {ratio:.2f}x")
+
+    # ─── End-to-end pipeline (GPU-native generation + simulation) ────
+    print(f"\n{'─'*75}")
+    print(f"End-to-end pipeline (generate_qv8_circuits_gpu + qv8_simulate):")
+    for c_test in [100, 1000, 10000]:
+        def gpu_pipeline():
+            gm_g, gq_g, ng_g = generate_qv8_circuits_gpu(c_test, seed=42, device=device)
+            return qv8_simulate(gm_g, gq_g, c_test)
+        e2e_ms = bench(gpu_pipeline, warmup=5, timed=50)
+        print(f"  {c_test:>5} circuits end-to-end: {e2e_ms:.3f} ms ({c_test/e2e_ms:.0f} circuits/ms)")
 
 
 if __name__ == "__main__":
