@@ -1,0 +1,11 @@
+
+# Build artifacts
+*.so
+*.o
+build/
+*.egg-info/
+__pycache__/
+
+# Logs
+*.log
+.autokernel.*.alive
