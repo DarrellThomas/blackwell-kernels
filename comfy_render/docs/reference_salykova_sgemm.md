@@ -1,0 +1,1 @@
+../../common/docs/reference_salykova_sgemm.md

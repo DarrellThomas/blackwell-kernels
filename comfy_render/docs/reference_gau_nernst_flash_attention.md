@@ -1,0 +1,1 @@
+../../common/docs/reference_gau_nernst_flash_attention.md

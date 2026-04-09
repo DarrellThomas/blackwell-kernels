@@ -41,7 +41,7 @@ row = mem.conn.execute(
     "SELECT process_state, job_id FROM worker_state WHERE kernel_type = ?",
     (worker,),
 ).fetchone()
-rows = get_active_worker_jobs(mem, worker, exclude_done_handoffs=True)
+rows = get_active_worker_jobs(mem, worker, exclude_done_handoffs=False)
 rows.sort(key=lambda j: (int(j['priority']) if str(j['priority']).isdigit() else 99, j['updated_at'], j['id']))
 active_job = rows[0] if rows else None
 print((row['process_state'] if row else '').strip())
@@ -115,7 +115,7 @@ from factory_brain import ResearchMemory, get_active_worker_jobs
 worker = sys.argv[1]
 terminal = {'shipped', 'converged', 'parked', 'abandoned'}
 mem = ResearchMemory()
-rows = get_active_worker_jobs(mem, worker, exclude_done_handoffs=True)
+rows = get_active_worker_jobs(mem, worker, exclude_done_handoffs=False)
 rows.sort(key=lambda j: (int(j['priority']) if str(j['priority']).isdigit() else 99, j['updated_at'], j['id']))
 job = rows[0] if rows else None
 if not job:

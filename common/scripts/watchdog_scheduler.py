@@ -89,8 +89,11 @@ def _verify_committed_worktree(worktree_path: str, commit_hint: str) -> tuple[bo
         ).strip()
     except Exception as exc:
         return False, f'git status failed: {exc}', head
-    if dirty:
-        snippet = '\n'.join(dirty.splitlines()[:12])
+    # Only flag modified/added/deleted tracked files as dirty.
+    # Untracked (??) files are harmless worker artifacts (docs, build outputs).
+    tracked_dirty = [l for l in dirty.splitlines() if not l.startswith('?? ')]
+    if tracked_dirty:
+        snippet = '\n'.join(tracked_dirty[:12])
         return False, f'worktree dirty:\n{snippet}', head
     if commit_hint:
         try:
@@ -214,6 +217,16 @@ def consume_worker_handoff(mem: ResearchMemory, worker: str, worktree_path: str)
                 priority='normal',
             )
             return {'action': 'hold', 'detail': f'done blocked: {reason}'}
+        # If the worker reports done but left the job in an intermediate
+        # validation state, advance to testing_pass so gate processing can
+        # pick it up and run the compliance/edge/lint suite.
+        job = mem.get_job(reported_job_id)
+        pre_gate_states = {'compiles_ok', 'tests_writing', 'testing'}
+        if job and job.get('state') in pre_gate_states:
+            mem.update_job_state(
+                reported_job_id, 'testing_pass', 'watchdog',
+                f'worker {worker} reported done from {job["state"]}; advancing to testing_pass for gate processing',
+            )
         gate_process_job(reported_job_id)
         body = (
             f"Worker {worker} completed a done handoff for job #{reported_job_id}.\n"

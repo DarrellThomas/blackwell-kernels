@@ -1,0 +1,1 @@
+../../common/docs/reference_bank_conflict_swizzle_patterns.md

@@ -1,0 +1,1 @@
+../../common/docs/reference_ptx_register_allocation.md
