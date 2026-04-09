@@ -21,7 +21,7 @@ constexpr int Bc = 64;
 constexpr int WARP_SIZE = 32;
 
 // ═══════════════════════════════════════════════════════════════════════
-// MMA kernel for D=64 with cp.async + double-buffer
+// MMA kernel for D=64 with cp.async, single-buffer for occupancy
 // ═══════════════════════════════════════════════════════════════════════
 template <bool CAUSAL>
 __global__ void __launch_bounds__(128)
@@ -41,7 +41,6 @@ flash_attn_mma_d64(
     constexpr int K_STEPS = 4;  // D/16
     constexpr int N_TILES = 8;  // Bc/8 = D/8
     constexpr int ACC = 32;     // N_TILES * 4
-    constexpr int KV_BUF = Bc * STRIDE;
     constexpr int KV_CHUNKS = Bc * (D / 8); // 512 cp.async chunks per tile
 
     const int bh = blockIdx.x;
@@ -57,11 +56,12 @@ flash_attn_mma_d64(
     const __nv_bfloat16* V_ptr = V + (size_t)bh * N * D;
     __nv_bfloat16*       O_ptr = O + (size_t)bh * N * D;
 
-    // Smem: Q[Br*S] + K/P[2*Bc*S] + V[2*Bc*S]  (P aliases K[cur_buf])
+    // Smem: Q[Br*S] + K/P[Bc*S] + V[Bc*S]  (P aliases K after S computation)
+    // 28 KB total → 3 blocks per SM (25% occupancy)
     extern __shared__ char smem[];
-    __nv_bfloat16* q_smem   = reinterpret_cast<__nv_bfloat16*>(smem);
-    __nv_bfloat16* kp_base  = q_smem + Br * STRIDE;
-    __nv_bfloat16* v_base   = kp_base + 2 * KV_BUF;
+    __nv_bfloat16* q_smem = reinterpret_cast<__nv_bfloat16*>(smem);
+    __nv_bfloat16* k_smem = q_smem + Br * STRIDE;
+    __nv_bfloat16* v_smem = k_smem + Bc * STRIDE;
 
     // ─── Load Q to smem ───────────────────────────────────────────────
     for (int idx = tid; idx < Br * STRIDE; idx += BLOCK) {
@@ -70,21 +70,6 @@ flash_attn_mma_d64(
         q_smem[idx] = (gr < N && c < D)
             ? Q_ptr[gr * D + c] : __float2bfloat16(0.0f);
     }
-
-    // ─── Prefetch first KV tile into buffer 0 ────────────────────────
-    {
-        __nv_bfloat16* kb = kp_base;
-        __nv_bfloat16* vb = v_base;
-        for (int ci = tid; ci < KV_CHUNKS; ci += BLOCK) {
-            int row = ci / (D / 8);
-            int col = (ci % (D / 8)) * 8;
-            int gr = row;
-            bk::cp_async_128_zfill(&kb[row * STRIDE + col], &K_ptr[gr * D + col], gr < N);
-            bk::cp_async_128_zfill(&vb[row * STRIDE + col], &V_ptr[gr * D + col], gr < N);
-        }
-        bk::cp_async_commit();
-    }
-    bk::cp_async_wait_all();
     __syncthreads();
 
     // ─── Accumulators ────────────────────────────────────────────────
@@ -106,25 +91,18 @@ flash_attn_mma_d64(
 
     for (int kv_t = 0; kv_t < kv_end; kv_t++) {
         const int kv_start = kv_t * Bc;
-        const int buf = kv_t & 1;
-        __nv_bfloat16* k_smem = kp_base + buf * KV_BUF;
-        __nv_bfloat16* v_smem = v_base  + buf * KV_BUF;
 
-        // ─── Prefetch next KV tile into opposite buffer ─────────────
-        if (kv_t + 1 < kv_end) {
-            const int nxt = (kv_t + 1) * Bc;
-            const int nb  = 1 - buf;
-            __nv_bfloat16* kb = kp_base + nb * KV_BUF;
-            __nv_bfloat16* vb = v_base  + nb * KV_BUF;
-            for (int ci = tid; ci < KV_CHUNKS; ci += BLOCK) {
-                int row = ci / (D / 8);
-                int col = (ci % (D / 8)) * 8;
-                int gr = nxt + row;
-                bk::cp_async_128_zfill(&kb[row * STRIDE + col], &K_ptr[gr * D + col], gr < N);
-                bk::cp_async_128_zfill(&vb[row * STRIDE + col], &V_ptr[gr * D + col], gr < N);
-            }
-            bk::cp_async_commit();
+        // ─── Load K + V via cp.async ────────────────────────────────
+        for (int ci = tid; ci < KV_CHUNKS; ci += BLOCK) {
+            int row = ci / (D / 8);
+            int col = (ci % (D / 8)) * 8;
+            int gr = kv_start + row;
+            bk::cp_async_128_zfill(&k_smem[row * STRIDE + col], &K_ptr[gr * D + col], gr < N);
+            bk::cp_async_128_zfill(&v_smem[row * STRIDE + col], &V_ptr[gr * D + col], gr < N);
         }
+        bk::cp_async_commit();
+        bk::cp_async_wait_all();
+        __syncthreads();
 
         // ─── S = Q @ K^T via MMA ────────────────────────────────────
         float s_acc[ACC];
@@ -254,11 +232,6 @@ flash_attn_mma_d64(
                     o_acc[n*4], o_acc[n*4+1], o_acc[n*4+2], o_acc[n*4+3]);
             }
         }
-
-        // ─── Wait for prefetch + barrier ─────────────────────────────
-        if (kv_t + 1 < kv_end) {
-            bk::cp_async_wait_all();
-        }
         __syncthreads();
     }
 
@@ -381,7 +354,7 @@ torch::Tensor flash_attn_forward(
 
     constexpr int PAD=8;
     if(D==64){
-        int sm=(Br+4*Bc)*(64+PAD)*sizeof(__nv_bfloat16); // Q + K/P×2 + V×2
+        int sm=(Br+2*Bc)*(64+PAD)*sizeof(__nv_bfloat16); // Q + K/P + V
         auto fn=causal?flash_attn_mma_d64<true>:flash_attn_mma_d64<false>;
         fn<<<grid,128,sm>>>(d.q,d.k,d.v,d.o,N,sc);
     } else {
