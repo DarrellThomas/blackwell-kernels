@@ -290,8 +290,8 @@ def fill_active_lanes(mem: ResearchMemory, managed_workers):
 
 
 def gate_process_active(mem: ResearchMemory):
-    gate_states = ['testing_pass', 'edge_pass', 'lint_pass', 'ready_to_ship',
-                   'testing_fail', 'edge_fail', 'lint_fail',
+    gate_states = ['testing_pass', 'retest_pass', 'edge_pass', 'lint_pass', 'ready_to_ship',
+                   'testing_fail', 'retest_fail', 'edge_fail', 'lint_fail',
                    'stuck_needs_research', 'research_available']
     for job in mem.get_jobs(execution_lane='active'):
         if job['state'] in gate_states:

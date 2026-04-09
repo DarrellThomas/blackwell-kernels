@@ -325,6 +325,17 @@ def resolve_job_source_path(job) -> Optional[Path]:
 
 
 def resolve_job_project_dir(job) -> Optional[Path]:
+    # Prefer dedicated watchdog worktree when it exists — the worker's branch
+    # has the latest tested code, which may include edge tests not yet merged.
+    kernel = (job.get("kernel_type") or "").strip()
+    if kernel:
+        worktree_root = Path(os.environ.get(
+            "WATCHDOG_WORKTREE_ROOT",
+            str(BWK_ROOT / "data" / "watchdog-worktrees")))
+        candidate = worktree_root / kernel / "current" / kernel
+        if candidate.is_dir():
+            return candidate
+
     source_path = resolve_job_source_path(job)
     if source_path is not None:
         repo_root = _repo_root_for_path(source_path)
@@ -343,7 +354,6 @@ def resolve_job_project_dir(job) -> Optional[Path]:
         if candidate.is_dir():
             return candidate
 
-    kernel = (job.get("kernel_type") or "").strip()
     if kernel:
         candidate = BWK_ROOT / kernel
         if candidate.is_dir():

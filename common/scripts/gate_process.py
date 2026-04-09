@@ -143,8 +143,8 @@ def gate_process_job(job_id):
     print(f'Job #{jid} ({name}): {state} [{job["phase"]}]')
 
 
-    # --- testing_pass → run compliance + extended gate suite ---
-    if state == 'testing_pass' and project_dir:
+    # --- testing_pass / retest_pass → run compliance + extended gate suite ---
+    if state in ('testing_pass', 'retest_pass') and project_dir:
         print(f'  → running edge tests and compliance suite...')
         mem.update_job_state(jid, 'edge_testing', 'gate', 'running compliance + edge tests')
         if project_dir: update_phase_context(project_dir, 'edge_testing')
@@ -319,7 +319,7 @@ def gate_process_job(job_id):
     state = job['state']
 
     # --- Fail states → rework ---
-    if state in ('testing_fail', 'edge_fail', 'lint_fail'):
+    if state in ('testing_fail', 'edge_fail', 'lint_fail', 'retest_fail'):
         mem.update_job_state(jid, 'rework', 'gate', f'{state} → rework')
         if project_dir: update_phase_context(project_dir, 'rework')
         mem.ensure_open_message('gate', f'{name} sent back for rework ({state})',
