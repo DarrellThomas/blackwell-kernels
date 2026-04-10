@@ -76,11 +76,12 @@ flash_attn_mma_d64(
     __nv_bfloat16* q_smem  = reinterpret_cast<__nv_bfloat16*>(smem);
     __nv_bfloat16* kv_smem = q_smem + Br * STRIDE;
 
-    // ─── Load Q to smem with XOR swizzle ─────────────────────────────
+    // ─── Load Q to smem with XOR swizzle, pre-scaled by 1/sqrt(D) ────
     for (int idx = tid; idx < Br * D; idx += BLOCK) {
         int r = idx / D, c = idx % D;
         int gr = q_start + r;
-        q_smem[swz(r, c)] = (gr < N) ? Q_ptr[gr * D + c] : __float2bfloat16(0.0f);
+        float qval = (gr < N) ? __bfloat162float(Q_ptr[gr * D + c]) * scale : 0.0f;
+        q_smem[swz(r, c)] = __float2bfloat16(qval);
     }
     __syncthreads();
 
@@ -162,10 +163,7 @@ flash_attn_mma_d64(
             int col0 = n * 8 + (lane % 4) * 2;
             int kv0 = kv_start + col0, kv1 = kv0 + 1;
 
-            s_acc[n*4]   *= scale;
-            s_acc[n*4+1] *= scale;
-            s_acc[n*4+2] *= scale;
-            s_acc[n*4+3] *= scale;
+            // scale already baked into Q fragments (pre-scaled in smem load)
 
             if (kv0 >= N || (CAUSAL && kv0 > global_row_a)) s_acc[n*4]   = -FLT_MAX;
             if (kv1 >= N || (CAUSAL && kv1 > global_row_a)) s_acc[n*4+1] = -FLT_MAX;
