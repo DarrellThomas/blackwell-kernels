@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Darrell Thomas. MIT License. See LICENSE file.
 //
 // Flash Attention forward for sm_120a (RTX 5090).
-// MMA kernel for D=64: Q in regs, single KV buffer, XOR swizzle.
+// MMA kernel for D=64: Q in regs, separate K/V buffers, XOR swizzle.
 // Scalar fallback for D=40, D=128.
 
 #include <cuda_runtime.h>
@@ -37,7 +37,8 @@ __device__ __forceinline__ uint32_t pack_bf16_pair(float a, float b) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// MMA kernel for D=64: Q in registers, single KV buffer, XOR swizzle
+// MMA kernel for D=64: Q in registers, separate K/V buffers, XOR swizzle
+// K in kv_smem, V in reused q_smem (dead after Q preload)
 // ═══════════════════════════════════════════════════════════════════════
 template <bool CAUSAL>
 __global__ void __launch_bounds__(128)
@@ -116,15 +117,19 @@ flash_attn_mma_d64(
     }
     __syncthreads(); // Q smem no longer needed after this
 
+    // Reuse dead Q_smem as a separate V buffer — K and V load simultaneously
+    __nv_bfloat16* v_smem = q_smem;
+
     for (int kv_t = 0; kv_t < kv_end; kv_t++) {
         const int kv_start = kv_t * Bc;
 
-        // ─── Load K tile into kv_smem ────────────────────────────────
+        // ─── Load K + V simultaneously via cp.async ──────────────────
         for (int ci = tid; ci < KV_CHUNKS; ci += BLOCK) {
             int row = ci / (D / 8);
             int col = (ci % (D / 8)) * 8;
             int gr = kv_start + row;
             bk::cp_async_128_zfill(&kv_smem[swz(row, col)], &K_ptr[gr * D + col], gr < N);
+            bk::cp_async_128_zfill(&v_smem[swz(row, col)], &V_ptr[gr * D + col], gr < N);
         }
         bk::cp_async_commit();
         bk::cp_async_wait_all();
@@ -214,19 +219,7 @@ flash_attn_mma_d64(
         }
         l_a += lt_a; l_b += lt_b;
 
-        // ─── Load V tile into kv_smem ────────────────────────────────
-        __syncthreads();
-        for (int ci = tid; ci < KV_CHUNKS; ci += BLOCK) {
-            int row = ci / (D / 8);
-            int col = (ci % (D / 8)) * 8;
-            int gr = kv_start + row;
-            bk::cp_async_128_zfill(&kv_smem[swz(row, col)], &V_ptr[gr * D + col], gr < N);
-        }
-        bk::cp_async_commit();
-        bk::cp_async_wait_all();
-        __syncthreads();
-
-        // ─── O += P @ V via MMA (V in kv_smem, P from registers) ────
+        // ─── O += P @ V via MMA (V in v_smem, P from registers) ─────
         #pragma unroll
         for (int k = 0; k < K_STEPS; k++) {
             int nt0 = k * 2, nt1 = k * 2 + 1;
@@ -243,7 +236,7 @@ flash_attn_mma_d64(
                     int vrow = k * 16 + mat * 8 + (lane & 7);
                     int vcol = n * 8;
                     bk::ldmatrix_x2_trans(vb0, vb1,
-                        &kv_smem[swz(vrow, vcol)]);
+                        &v_smem[swz(vrow, vcol)]);
                 }
                 bk::mma_m16n8k16_bf16_nv(
                     o_acc[n*4], o_acc[n*4+1], o_acc[n*4+2], o_acc[n*4+3],
