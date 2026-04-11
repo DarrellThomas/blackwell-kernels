@@ -246,9 +246,9 @@ flash_attn_mma_d64(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// D=64 Br=64 Bc=128: wider KV tiles, fewer loop iterations
-// Halves sync/loop overhead vs Bc=64. Matches cuDNN's tile width.
-// Smem: [Q/V: 16KB] [K: 16KB] = 32KB
+// D=64 Br=64 Bc=128: pipelined single-buffer K + V async overlap
+// V load overlaps QK^T; K[next] loads into same buffer during P@V.
+// Smem: [Q/V: 16KB] [K: 16KB] = 32KB (no extra smem vs unpipelined)
 // ═══════════════════════════════════════════════════════════════════════
 template <bool CAUSAL>
 __global__ void __launch_bounds__(128)
@@ -267,7 +267,7 @@ flash_attn_mma_d64_bc128(
     constexpr int PV_K = Bc / 16;     // 8  — k-steps for P@V
     constexpr int PV_N = D / 8;       // 8  — n-tiles for P@V
     constexpr int O_ACC = PV_N * 4;   // 32
-    constexpr int V_BUF = Bc * D;     // 8192 bf16 = 16KB (V > Q, so V sets buffer size)
+    constexpr int V_BUF = Bc * D;     // 8192 bf16 = 16KB
     constexpr int KV_CHUNKS = Bc * (D / 8); // 1024
 
     const int bh = blockIdx.x;
@@ -285,7 +285,7 @@ flash_attn_mma_d64_bc128(
     __nv_bfloat16* qv_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);
     __nv_bfloat16* k_smem  = qv_smem + V_BUF;
 
-    // ─── Load Q to smem via cp.async (Q uses first Br*D of qv_smem) ──
+    // ─── Load Q to smem via cp.async ────────────────────────────────
     constexpr int Q_CHUNKS = Br * (D / 8);
     for (int ci = tid; ci < Q_CHUNKS; ci += BLOCK) {
         int row = ci / (D / 8), col8 = (ci % (D / 8)) * 8;
@@ -297,7 +297,7 @@ flash_attn_mma_d64_bc128(
     __syncthreads();
 
     // ─── Q → registers ──────────────────────────────────────────────
-    uint32_t q_frag[QK_K * 4]; // 16 uint32
+    uint32_t q_frag[QK_K * 4];
     #pragma unroll
     for (int k = 0; k < QK_K; k++) {
         int sub = lane / 8, sub_row = lane % 8;
@@ -315,7 +315,7 @@ flash_attn_mma_d64_bc128(
     }
     __syncthreads();
 
-    // V reuses the full qv_smem (16KB, fits Bc*D = 128*64)
+    // V reuses qv_smem (Q already in registers)
     __nv_bfloat16* v_smem = qv_smem;
 
     float o_acc[O_ACC];
@@ -330,21 +330,29 @@ flash_attn_mma_d64_bc128(
     const int kv_tiles = (N + Bc - 1) / Bc;
     const int kv_end = CAUSAL ? min(kv_tiles, (q_start + Br + Bc - 1) / Bc) : kv_tiles;
 
+    // ─── Prologue: prefetch K[0] into k_smem ────────────────────────
+    for (int ci = tid; ci < KV_CHUNKS; ci += BLOCK) {
+        int row = ci / (D / 8), col8 = (ci % (D / 8)) * 8;
+        bk::cp_async_128_zfill(&k_smem[swz<D>(row, col8)], &K_ptr[row * D + col8], row < N);
+    }
+    bk::cp_async_commit();
+    bk::cp_async_wait_all();
+    __syncthreads();
+
+    // ─── Main loop (pipelined) ──────────────────────────────────────
     for (int kv_t = 0; kv_t < kv_end; kv_t++) {
         const int kv_start = kv_t * Bc;
+        const bool has_next = (kv_t + 1 < kv_end);
 
-        // ── Load K and V simultaneously via cp.async ─────────────────
+        // ── V async load (overlaps with QK^T compute) ───────────────
         for (int ci = tid; ci < KV_CHUNKS; ci += BLOCK) {
             int row = ci / (D / 8), col8 = (ci % (D / 8)) * 8;
             int gr = kv_start + row;
-            bk::cp_async_128_zfill(&k_smem[swz<D>(row, col8)], &K_ptr[gr * D + col8], gr < N);
             bk::cp_async_128_zfill(&v_smem[swz<D>(row, col8)], &V_ptr[gr * D + col8], gr < N);
         }
         bk::cp_async_commit();
-        bk::cp_async_wait_all();
-        __syncthreads();
 
-        // ── S = Q_regs @ K^T (4 k-steps × 16 n-tiles = 64 MMAs) ────
+        // ── S = Q_regs @ K^T (K already in k_smem, V loads in bg) ──
         float s_acc[S_ACC];
         #pragma unroll
         for (int i = 0; i < S_ACC; i++) s_acc[i] = 0.0f;
@@ -361,7 +369,22 @@ flash_attn_mma_d64_bc128(
             }
         }
 
-        // ── Softmax ──────────────────────────────────────────────────
+        // ── Wait V, sync (QK^T done → k_smem is free) ──────────────
+        bk::cp_async_wait<0>();
+        __syncthreads();
+
+        // ── K[next] prefetch into k_smem (reuse same buffer) ────────
+        if (has_next) {
+            int nxt = (kv_t + 1) * Bc;
+            for (int ci = tid; ci < KV_CHUNKS; ci += BLOCK) {
+                int row = ci / (D / 8), col8 = (ci % (D / 8)) * 8;
+                int gr = nxt + row;
+                bk::cp_async_128_zfill(&k_smem[swz<D>(row, col8)], &K_ptr[gr * D + col8], gr < N);
+            }
+            bk::cp_async_commit();
+        }
+
+        // ── Softmax (K[next] loads in background) ───────────────────
         float rmax_a = -FLT_MAX, rmax_b = -FLT_MAX;
         #pragma unroll
         for (int n = 0; n < QK_N; n++) {
@@ -397,7 +420,7 @@ flash_attn_mma_d64_bc128(
         for(int d=1;d<4;d<<=1){lt_a+=__shfl_xor_sync(0xffffffff,lt_a,d);lt_b+=__shfl_xor_sync(0xffffffff,lt_b,d);}
         l_a+=lt_a;l_b+=lt_b;
 
-        // ── O += P @ V (8 pk × 8 pn = 64 MMAs) ─────────────────────
+        // ── O += P @ V (K[next] still loading in background) ────────
         #pragma unroll
         for(int pk=0;pk<PV_K;pk++){
             int nt0=pk*2,nt1=pk*2+1;
@@ -411,10 +434,13 @@ flash_attn_mma_d64_bc128(
                     pa0,pa1,pa2,pa3,vb0,vb1, o_acc[pn*4],o_acc[pn*4+1],o_acc[pn*4+2],o_acc[pn*4+3]);
             }
         }
+
+        // ── Wait K[next], ensure V consumed ─────────────────────────
+        if (has_next) bk::cp_async_wait<0>();
         __syncthreads();
     }
 
-    // ─── Final normalize + store ─────────────────────────────────────
+    // ─── Final normalize + store ────────────────────────────────────
     float inv_a=(l_a>0)?(1.0f/l_a):0.0f, inv_b=(l_b>0)?(1.0f/l_b):0.0f;
     #pragma unroll
     for(int n=0;n<PV_N;n++){
@@ -903,6 +929,226 @@ flash_attn_mma_d128(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// D=40 MMA kernel: pad to DP=64 for swizzle + m16n8k16 alignment.
+// Identical MMA structure to D=64, but loads zero-fill cols 40-63
+// and stores only cols 0-39.
+// Smem: Q/V[8KB] + K_A[8KB] + K_B[8KB] = 24KB
+// ═══════════════════════════════════════════════════════════════════════
+template <bool CAUSAL>
+__global__ void __launch_bounds__(128)
+flash_attn_mma_d40(
+    const __nv_bfloat16* __restrict__ Q,
+    const __nv_bfloat16* __restrict__ K,
+    const __nv_bfloat16* __restrict__ V,
+    __nv_bfloat16* __restrict__ O,
+    const int N, const float scale
+) {
+    constexpr int D = 40, DP = 64;
+    constexpr int Br = 64, Bc = 64;
+    constexpr int BLOCK = 128, WARP_ROWS = 16;
+    constexpr int K_STEPS = DP / 16;   // 4
+    constexpr int N_TILES = Bc / 8;    // 8
+    constexpr int ACC = N_TILES * 4;   // 32
+    constexpr int PV_K = Bc / 16;      // 4
+    constexpr int PV_N = DP / 8;       // 8 (5 real + 3 padded)
+    constexpr int O_ACC = PV_N * 4;    // 32
+    constexpr int TILE_CHUNKS = Bc * (DP / 8); // 512
+
+    const int bh = blockIdx.x;
+    const int q_start = blockIdx.y * Br;
+    if (q_start >= N) return;
+
+    const int tid = threadIdx.x, warp_id = tid / WARP_SIZE, lane = tid % WARP_SIZE;
+    const __nv_bfloat16* Q_ptr = Q + (size_t)bh * N * D;
+    const __nv_bfloat16* K_ptr = K + (size_t)bh * N * D;
+    const __nv_bfloat16* V_ptr = V + (size_t)bh * N * D;
+    __nv_bfloat16*       O_ptr = O + (size_t)bh * N * D;
+
+    // Smem: [Q/V: Br*DP = 8KB] [K_A: Bc*DP = 8KB] [K_B: 8KB] = 24KB
+    extern __shared__ char smem_raw[];
+    __nv_bfloat16* q_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* k_smem_a = q_smem + Br * DP;
+    __nv_bfloat16* k_smem_b = k_smem_a + Bc * DP;
+
+    // ─── Load Q to smem: cp.async for cols<40, zero-fill cols 40-63 ─
+    constexpr int Q_CHUNKS = Br * (DP / 8);
+    for (int ci = tid; ci < Q_CHUNKS; ci += BLOCK) {
+        int row = ci / (DP / 8), col8 = (ci % (DP / 8)) * 8;
+        int gr = q_start + row;
+        bk::cp_async_128_zfill(&q_smem[swz<DP>(row, col8)],
+            &Q_ptr[gr * D + col8], (gr < N) && (col8 + 8 <= D));
+    }
+    bk::cp_async_commit();
+    bk::cp_async_wait_all();
+    __syncthreads();
+
+    // ─── Q → registers + BF16 pre-scale ─────────────────────────────
+    float o_acc[O_ACC];
+    #pragma unroll
+    for (int i = 0; i < O_ACC; i++) o_acc[i] = 0.0f;
+
+    uint32_t q_frag[K_STEPS * 4];
+    #pragma unroll
+    for (int k = 0; k < K_STEPS; k++) {
+        int sub = lane / 8, sub_row = lane % 8;
+        int row = warp_id * WARP_ROWS + (sub < 2 ? sub_row : 8 + sub_row);
+        int col = k * 16 + (sub % 2) * 8;
+        bk::ldmatrix_x4_mma(q_frag[k*4], q_frag[k*4+1], q_frag[k*4+2], q_frag[k*4+3],
+            &q_smem[swz<DP>(row, col)]);
+    }
+
+    uint32_t scale_packed = pack_bf16_pair(scale, scale);
+    #pragma unroll
+    for (int i = 0; i < K_STEPS * 4; i++) {
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(q_frag[i]) : "r"(q_frag[i]), "r"(scale_packed));
+    }
+    __syncthreads();
+
+    __nv_bfloat16* v_smem = q_smem;
+
+    const int mma_row_a = lane / 4, mma_row_b = mma_row_a + 8;
+    const int global_row_a = q_start + warp_id * WARP_ROWS + mma_row_a;
+    const int global_row_b = q_start + warp_id * WARP_ROWS + mma_row_b;
+    float m_a = -FLT_MAX, l_a = 0.0f, m_b = -FLT_MAX, l_b = 0.0f;
+
+    const int kv_tiles = (N + Bc - 1) / Bc;
+    const int kv_end = CAUSAL ? min(kv_tiles, (q_start + Br + Bc - 1) / Bc) : kv_tiles;
+    int k_phase = 0;
+
+    // ─── Prologue: prefetch K[0] ────────────────────────────────────
+    for (int ci = tid; ci < TILE_CHUNKS; ci += BLOCK) {
+        int row = ci / (DP / 8), col8 = (ci % (DP / 8)) * 8;
+        bk::cp_async_128_zfill(&k_smem_a[swz<DP>(row, col8)],
+            &K_ptr[row * D + col8], (row < N) && (col8 + 8 <= D));
+    }
+    bk::cp_async_commit();
+    bk::cp_async_wait_all();
+    __syncthreads();
+
+    // ─── Main loop (pipelined) ──────────────────────────────────────
+    for (int kv_t = 0; kv_t < kv_end; kv_t++) {
+        const int kv_start = kv_t * Bc;
+        __nv_bfloat16* k_cur = k_phase ? k_smem_b : k_smem_a;
+        const bool has_next = (kv_t + 1 < kv_end);
+
+        // ── V async load (zero-fill padding cols) ────────────────────
+        for (int ci = tid; ci < TILE_CHUNKS; ci += BLOCK) {
+            int row = ci / (DP / 8), col8 = (ci % (DP / 8)) * 8;
+            int gr = kv_start + row;
+            bk::cp_async_128_zfill(&v_smem[swz<DP>(row, col8)],
+                &V_ptr[gr * D + col8], (gr < N) && (col8 + 8 <= D));
+        }
+        bk::cp_async_commit();
+
+        // ── S = Q_regs @ K^T ────────────────────────────────────────
+        float s_acc[ACC];
+        #pragma unroll
+        for (int i = 0; i < ACC; i++) s_acc[i] = 0.0f;
+
+        #pragma unroll
+        for (int k = 0; k < K_STEPS; k++) {
+            uint32_t a0 = q_frag[k*4], a1 = q_frag[k*4+1], a2 = q_frag[k*4+2], a3 = q_frag[k*4+3];
+            #pragma unroll
+            for (int n = 0; n < N_TILES; n++) {
+                uint32_t b0, b1;
+                { int mat=(lane>>3)&1; bk::ldmatrix_x2(b0,b1,&k_cur[swz<DP>(n*8+(lane&7), k*16+mat*8)]); }
+                bk::mma_m16n8k16_bf16_nv(s_acc[n*4],s_acc[n*4+1],s_acc[n*4+2],s_acc[n*4+3],
+                    a0,a1,a2,a3,b0,b1, s_acc[n*4],s_acc[n*4+1],s_acc[n*4+2],s_acc[n*4+3]);
+            }
+        }
+
+        // ── K[next] prefetch ─────────────────────────────────────────
+        if (has_next) {
+            int nxt = (kv_t + 1) * Bc;
+            __nv_bfloat16* k_nxt = k_phase ? k_smem_a : k_smem_b;
+            for (int ci = tid; ci < TILE_CHUNKS; ci += BLOCK) {
+                int row = ci / (DP / 8), col8 = (ci % (DP / 8)) * 8;
+                int gr = nxt + row;
+                bk::cp_async_128_zfill(&k_nxt[swz<DP>(row, col8)],
+                    &K_ptr[gr * D + col8], (gr < N) && (col8 + 8 <= D));
+            }
+            bk::cp_async_commit();
+        }
+
+        // ── Wait V ───────────────────────────────────────────────────
+        if (has_next) bk::cp_async_wait<1>();
+        else          bk::cp_async_wait<0>();
+        __syncthreads();
+
+        // ── Softmax ─────────────────────────────────────────────────
+        float rmax_a = -FLT_MAX, rmax_b = -FLT_MAX;
+        #pragma unroll
+        for (int n = 0; n < N_TILES; n++) {
+            int col0 = n*8+(lane%4)*2, kv0 = kv_start+col0, kv1 = kv0+1;
+            if (kv0>=N||(CAUSAL&&kv0>global_row_a)) s_acc[n*4]=-FLT_MAX;
+            if (kv1>=N||(CAUSAL&&kv1>global_row_a)) s_acc[n*4+1]=-FLT_MAX;
+            if (kv0>=N||(CAUSAL&&kv0>global_row_b)) s_acc[n*4+2]=-FLT_MAX;
+            if (kv1>=N||(CAUSAL&&kv1>global_row_b)) s_acc[n*4+3]=-FLT_MAX;
+            if (global_row_a>=N){s_acc[n*4]=-FLT_MAX;s_acc[n*4+1]=-FLT_MAX;}
+            if (global_row_b>=N){s_acc[n*4+2]=-FLT_MAX;s_acc[n*4+3]=-FLT_MAX;}
+            rmax_a=fmaxf(rmax_a,fmaxf(s_acc[n*4],s_acc[n*4+1]));
+            rmax_b=fmaxf(rmax_b,fmaxf(s_acc[n*4+2],s_acc[n*4+3]));
+        }
+        #pragma unroll
+        for (int d=1;d<4;d<<=1){rmax_a=fmaxf(rmax_a,__shfl_xor_sync(0xffffffff,rmax_a,d));rmax_b=fmaxf(rmax_b,__shfl_xor_sync(0xffffffff,rmax_b,d));}
+
+        float m_new_a=fmaxf(m_a,rmax_a), m_new_b=fmaxf(m_b,rmax_b);
+        float sc_a=__expf(m_a-m_new_a), sc_b=__expf(m_b-m_new_b);
+        #pragma unroll
+        for(int i=0;i<O_ACC;i+=4){o_acc[i]*=sc_a;o_acc[i+1]*=sc_a;o_acc[i+2]*=sc_b;o_acc[i+3]*=sc_b;}
+        l_a*=sc_a;l_b*=sc_b;m_a=m_new_a;m_b=m_new_b;
+
+        float lt_a=0,lt_b=0;
+        #pragma unroll
+        for(int n=0;n<N_TILES;n++){
+            float p0=__expf(s_acc[n*4]-m_new_a);
+            float p1=__expf(s_acc[n*4+1]-m_new_a);
+            float p2=__expf(s_acc[n*4+2]-m_new_b);
+            float p3=__expf(s_acc[n*4+3]-m_new_b);
+            lt_a+=p0+p1;lt_b+=p2+p3;s_acc[n*4]=p0;s_acc[n*4+1]=p1;s_acc[n*4+2]=p2;s_acc[n*4+3]=p3;
+        }
+        #pragma unroll
+        for(int d=1;d<4;d<<=1){lt_a+=__shfl_xor_sync(0xffffffff,lt_a,d);lt_b+=__shfl_xor_sync(0xffffffff,lt_b,d);}
+        l_a+=lt_a;l_b+=lt_b;
+
+        // ── O += P @ V ──────────────────────────────────────────────
+        #pragma unroll
+        for(int pk=0;pk<PV_K;pk++){
+            int nt0=pk*2,nt1=pk*2+1;
+            uint32_t pa0=pack_bf16_pair(s_acc[nt0*4],s_acc[nt0*4+1]),pa1=pack_bf16_pair(s_acc[nt0*4+2],s_acc[nt0*4+3]);
+            uint32_t pa2=pack_bf16_pair(s_acc[nt1*4],s_acc[nt1*4+1]),pa3=pack_bf16_pair(s_acc[nt1*4+2],s_acc[nt1*4+3]);
+            #pragma unroll
+            for(int pn=0;pn<PV_N;pn++){
+                uint32_t vb0,vb1;
+                {int mat=(lane>>3)&1;bk::ldmatrix_x2_trans(vb0,vb1,&v_smem[swz<DP>(pk*16+mat*8+(lane&7),pn*8)]);}
+                bk::mma_m16n8k16_bf16_nv(o_acc[pn*4],o_acc[pn*4+1],o_acc[pn*4+2],o_acc[pn*4+3],
+                    pa0,pa1,pa2,pa3,vb0,vb1, o_acc[pn*4],o_acc[pn*4+1],o_acc[pn*4+2],o_acc[pn*4+3]);
+            }
+        }
+
+        // ── Wait K[next], ensure V consumed ──────────────────────────
+        if (has_next) bk::cp_async_wait<0>();
+        __syncthreads();
+        k_phase ^= 1;
+    }
+
+    // ─── Final normalize + store (only D=40 columns) ────────────────
+    float inv_a=(l_a>0)?(1.0f/l_a):0.0f, inv_b=(l_b>0)?(1.0f/l_b):0.0f;
+    #pragma unroll
+    for(int n=0;n<PV_N;n++){
+        int col0=n*8+(lane%4)*2;
+        if(global_row_a<N&&col0+1<D){
+            uint32_t p=pack_bf16_pair(o_acc[n*4]*inv_a, o_acc[n*4+1]*inv_a);
+            *reinterpret_cast<uint32_t*>(&O_ptr[global_row_a*D+col0])=p;
+        }
+        if(global_row_b<N&&col0+1<D){
+            uint32_t p=pack_bf16_pair(o_acc[n*4+2]*inv_b, o_acc[n*4+3]*inv_b);
+            *reinterpret_cast<uint32_t*>(&O_ptr[global_row_b*D+col0])=p;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Scalar fallback for D=40
 // ═══════════════════════════════════════════════════════════════════════
 template <int HEAD_DIM, bool CAUSAL>
@@ -1022,10 +1268,10 @@ torch::Tensor flash_attn_forward(
         cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
         fn<<<grid,128,sm>>>(d.q,d.k,d.v,d.o,N,sc);
     } else {
+        constexpr int DP = 64; // D_PAD for D=40
         dim3 grid(B*H, (N+Br64-1)/Br64);
-        constexpr int PAD=8;
-        int sm = 2*Bc*(D+PAD)*sizeof(__nv_bfloat16);
-        auto fn = causal ? flash_attn_scalar<40,true> : flash_attn_scalar<40,false>;
+        int sm = (Br64 + 2*Bc)*DP*sizeof(__nv_bfloat16); // 24KB
+        auto fn = causal ? flash_attn_mma_d40<true> : flash_attn_mma_d40<false>;
         fn<<<grid,128,sm>>>(d.q,d.k,d.v,d.o,N,sc);
     }
     return O;
