@@ -2,9 +2,9 @@
 //
 // Flash Attention forward for sm_120a (RTX 5090).
 // D=64 dispatch:
-//   Causal: Br=64 Bc=64 K double-buffer (1.07x cuDNN)
-//   Non-causal N<4096: Br=64 Bc=128 single K buffer (0.96x cuDNN)
-//   Non-causal N>=4096: Br=128 Bc=64 K double-buffer + K reuse (0.97x cuDNN)
+//   Causal: Br=64 Bc=64 K double-buffer (1.06x cuDNN)
+//   Non-causal N<=2048: Br=64 Bc=64 K double-buffer (0.95-1.03x cuDNN)
+//   Non-causal N>2048: Br=128 Bc=64 K double-buffer + K reuse (0.92-0.97x cuDNN)
 // D=128: MMA kernel with K double-buffer pipeline.
 // D=40: MMA kernel with D→64 zero-padding.
 
@@ -158,7 +158,7 @@ flash_attn_mma_d64(
             }
         }
 
-        // ── K[next] prefetch ─────────────────────────────��────────────
+        // ── K[next] prefetch ────────────────────────────────────────────
         if (has_next) {
             int nxt = (kv_t + 1) * Bc;
             __nv_bfloat16* k_nxt = k_phase ? k_smem_a : k_smem_b;
@@ -170,12 +170,7 @@ flash_attn_mma_d64(
             bk::cp_async_commit();
         }
 
-        // ── Wait for V ──────────────────────────────────���────────────
-        if (has_next) bk::cp_async_wait<1>();
-        else          bk::cp_async_wait<0>();
-        __syncthreads();
-
-        // ── Softmax ─────────────────────────────────��────────────────
+        // ── Softmax (register-only — V+K load in background!) ──────
         float rmax_a = -FLT_MAX, rmax_b = -FLT_MAX;
         #pragma unroll
         for (int n = 0; n < N_TILES; n++) {
@@ -210,6 +205,11 @@ flash_attn_mma_d64(
         #pragma unroll
         for(int d=1;d<4;d<<=1){lt_a+=__shfl_xor_sync(0xffffffff,lt_a,d);lt_b+=__shfl_xor_sync(0xffffffff,lt_b,d);}
         l_a+=lt_a;l_b+=lt_b;
+
+        // ── Wait for V (softmax done, V had QK^T+softmax to load) ──
+        if (has_next) bk::cp_async_wait<1>();
+        else          bk::cp_async_wait<0>();
+        __syncthreads();
 
         // ── O += P @ V ───────────────────────────────────────────────
         #pragma unroll
@@ -1254,21 +1254,20 @@ torch::Tensor flash_attn_forward(
     constexpr int Br64=64, Br128=128, Bc=64;
 
     if(D==64){
-        constexpr int Bc128 = 128;
         if (causal) {
             dim3 grid(B*H, (N+Br64-1)/Br64);
             int sm = (Br64 + 2*Bc)*D*sizeof(__nv_bfloat16); // 24KB
             flash_attn_mma_d64<true><<<grid,128,sm>>>(d.q,d.k,d.v,d.o,N,sc);
-        } else if (N >= 4096) {
-            // Long sequences: Br=128 K-reuse kernel (0.98x cuDNN at N=4096)
+        } else if (N <= 2048) {
+            // Short/medium: Br=64 Bc=64 K double-buffer, high occupancy
+            dim3 grid(B*H, (N+Br64-1)/Br64);
+            int sm = (Br64 + 2*Bc)*D*sizeof(__nv_bfloat16); // 24KB
+            flash_attn_mma_d64<false><<<grid,128,sm>>>(d.q,d.k,d.v,d.o,N,sc);
+        } else {
+            // Long: Br=128 Bc=64, K-reuse across 2 MMA-M tiles
             dim3 grid(B*H, (N+Br128-1)/Br128);
             int sm = (Br128 + 2*Bc)*D*sizeof(__nv_bfloat16); // 32KB
             flash_attn_mma_d64_br128<<<grid,128,sm>>>(d.q,d.k,d.v,d.o,N,sc);
-        } else {
-            // Short sequences: Bc=128 higher-occupancy kernel (0.96x cuDNN at N=1024)
-            dim3 grid(B*H, (N+Br64-1)/Br64);
-            int sm = (Bc128 + Bc128)*D*sizeof(__nv_bfloat16); // 32KB
-            flash_attn_mma_d64_bc128<false><<<grid,128,sm>>>(d.q,d.k,d.v,d.o,N,sc);
         }
     } else if(D==128){
         dim3 grid(B*H, (N+Br64-1)/Br64);
