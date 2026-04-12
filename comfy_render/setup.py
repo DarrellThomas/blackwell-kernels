@@ -17,6 +17,7 @@ setup(
             "blackwell_kernels._C",
             [
                 os.path.join(ROOT, "csrc/comfy_render/flash_attn_sm120a.cu"),
+                os.path.join(ROOT, "csrc/comfy_render/group_norm_linear_sm120a.cu"),
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],

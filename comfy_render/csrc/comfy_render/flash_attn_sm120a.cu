@@ -1277,8 +1277,18 @@ torch::Tensor flash_attn_forward(
     return O;
 }
 
+// Forward declaration: fused GroupNorm + Linear (group_norm_linear_sm120a.cu)
+torch::Tensor fused_group_norm_linear_forward(
+    torch::Tensor X, torch::Tensor weight,
+    torch::Tensor gamma, torch::Tensor beta,
+    torch::Tensor linear_bias, int64_t groups);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("flash_attn_forward", &flash_attn_forward,
           "Flash Attention forward (sm_120a)",
           py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("causal")=false);
+    m.def("fused_group_norm_linear_forward", &fused_group_norm_linear_forward,
+          "Fused GroupNorm + Linear forward (sm_120a)",
+          py::arg("X"), py::arg("weight"), py::arg("gamma"), py::arg("beta"),
+          py::arg("linear_bias"), py::arg("groups"));
 }

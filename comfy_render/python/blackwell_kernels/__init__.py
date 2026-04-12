@@ -4,4 +4,4 @@
 
 __version__ = "0.1.0"
 
-from blackwell_kernels.comfy_render import flash_attention
+from blackwell_kernels.comfy_render import flash_attention, fused_group_norm_linear
