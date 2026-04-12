@@ -1,12 +1,13 @@
 // Copyright (c) 2026 Darrell Thomas. MIT License. See LICENSE file.
 //
 // Flash Attention forward for sm_120a (RTX 5090).
+// LOG2E folded into Q scale → softmax uses exp2f (MUFU.EX2 direct, no MUL).
 // D=64 dispatch:
-//   Causal: Br=64 Bc=64 K double-buffer (1.06x cuDNN)
-//   Non-causal N<=2048: Br=64 Bc=64 K double-buffer (0.95-1.03x cuDNN)
-//   Non-causal N>2048: Br=128 Bc=64 K double-buffer + K reuse (0.92-0.97x cuDNN)
-// D=128: MMA kernel with K double-buffer pipeline.
-// D=40: MMA kernel with D→64 zero-padding.
+//   Causal: Br=64 Bc=64 K double-buffer (~1.03-1.09x cuDNN)
+//   Non-causal N<=2048: Br=64 Bc=64 K double-buffer (~0.93-0.96x cuDNN)
+//   Non-causal N>2048: Br=128 Bc=64 K double-buffer + K reuse (~0.92-0.97x cuDNN)
+// D=128: MMA kernel with K double-buffer pipeline (~0.95x cuDNN).
+// D=40: MMA kernel with D→64 zero-padding (~1.08-1.18x cuDNN).
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -188,7 +189,7 @@ flash_attn_mma_d64(
         for (int d=1;d<4;d<<=1){rmax_a=fmaxf(rmax_a,__shfl_xor_sync(0xffffffff,rmax_a,d));rmax_b=fmaxf(rmax_b,__shfl_xor_sync(0xffffffff,rmax_b,d));}
 
         float m_new_a=fmaxf(m_a,rmax_a), m_new_b=fmaxf(m_b,rmax_b);
-        float sc_a=__expf(m_a-m_new_a), sc_b=__expf(m_b-m_new_b);
+        float sc_a=exp2f(m_a-m_new_a), sc_b=exp2f(m_b-m_new_b);
         #pragma unroll
         for(int i=0;i<ACC;i+=4){o_acc[i]*=sc_a;o_acc[i+1]*=sc_a;o_acc[i+2]*=sc_b;o_acc[i+3]*=sc_b;}
         l_a*=sc_a;l_b*=sc_b;m_a=m_new_a;m_b=m_new_b;
@@ -196,10 +197,10 @@ flash_attn_mma_d64(
         float lt_a=0,lt_b=0;
         #pragma unroll
         for(int n=0;n<N_TILES;n++){
-            float p0=__expf(s_acc[n*4]-m_new_a);
-            float p1=__expf(s_acc[n*4+1]-m_new_a);
-            float p2=__expf(s_acc[n*4+2]-m_new_b);
-            float p3=__expf(s_acc[n*4+3]-m_new_b);
+            float p0=exp2f(s_acc[n*4]-m_new_a);
+            float p1=exp2f(s_acc[n*4+1]-m_new_a);
+            float p2=exp2f(s_acc[n*4+2]-m_new_b);
+            float p3=exp2f(s_acc[n*4+3]-m_new_b);
             lt_a+=p0+p1;lt_b+=p2+p3;s_acc[n*4]=p0;s_acc[n*4+1]=p1;s_acc[n*4+2]=p2;s_acc[n*4+3]=p3;
         }
         #pragma unroll
@@ -405,7 +406,7 @@ flash_attn_mma_d64_bc128(
         for (int d=1;d<4;d<<=1){rmax_a=fmaxf(rmax_a,__shfl_xor_sync(0xffffffff,rmax_a,d));rmax_b=fmaxf(rmax_b,__shfl_xor_sync(0xffffffff,rmax_b,d));}
 
         float m_new_a=fmaxf(m_a,rmax_a), m_new_b=fmaxf(m_b,rmax_b);
-        float sc_a=__expf(m_a-m_new_a), sc_b=__expf(m_b-m_new_b);
+        float sc_a=exp2f(m_a-m_new_a), sc_b=exp2f(m_b-m_new_b);
         #pragma unroll
         for(int i=0;i<O_ACC;i+=4){o_acc[i]*=sc_a;o_acc[i+1]*=sc_a;o_acc[i+2]*=sc_b;o_acc[i+3]*=sc_b;}
         l_a*=sc_a;l_b*=sc_b;m_a=m_new_a;m_b=m_new_b;
@@ -413,10 +414,10 @@ flash_attn_mma_d64_bc128(
         float lt_a=0,lt_b=0;
         #pragma unroll
         for(int n=0;n<QK_N;n++){
-            float p0=__expf(s_acc[n*4]-m_new_a);
-            float p1=__expf(s_acc[n*4+1]-m_new_a);
-            float p2=__expf(s_acc[n*4+2]-m_new_b);
-            float p3=__expf(s_acc[n*4+3]-m_new_b);
+            float p0=exp2f(s_acc[n*4]-m_new_a);
+            float p1=exp2f(s_acc[n*4+1]-m_new_a);
+            float p2=exp2f(s_acc[n*4+2]-m_new_b);
+            float p3=exp2f(s_acc[n*4+3]-m_new_b);
             lt_a+=p0+p1;lt_b+=p2+p3;s_acc[n*4]=p0;s_acc[n*4+1]=p1;s_acc[n*4+2]=p2;s_acc[n*4+3]=p3;
         }
         #pragma unroll
@@ -645,8 +646,8 @@ flash_attn_mma_d64_br128(
 
             float m_new_a = fmaxf(m_vals[mi], rmax_a);
             float m_new_b = fmaxf(m_vals[mi+1], rmax_b);
-            float sc_a = __expf(m_vals[mi] - m_new_a);
-            float sc_b = __expf(m_vals[mi+1] - m_new_b);
+            float sc_a = exp2f(m_vals[mi] - m_new_a);
+            float sc_b = exp2f(m_vals[mi+1] - m_new_b);
 
             #pragma unroll
             for (int n = 0; n < N_TILES; n++) {
@@ -661,10 +662,10 @@ flash_attn_mma_d64_br128(
             #pragma unroll
             for (int n = 0; n < N_TILES; n++) {
                 int si = (mq * N_TILES + n) * 4;
-                float p0 = __expf(s_acc[si]   - m_new_a);
-                float p1 = __expf(s_acc[si+1] - m_new_a);
-                float p2 = __expf(s_acc[si+2] - m_new_b);
-                float p3 = __expf(s_acc[si+3] - m_new_b);
+                float p0 = exp2f(s_acc[si]   - m_new_a);
+                float p1 = exp2f(s_acc[si+1] - m_new_a);
+                float p2 = exp2f(s_acc[si+2] - m_new_b);
+                float p3 = exp2f(s_acc[si+3] - m_new_b);
                 lt_a += p0 + p1; lt_b += p2 + p3;
                 s_acc[si] = p0; s_acc[si+1] = p1; s_acc[si+2] = p2; s_acc[si+3] = p3;
             }
@@ -878,7 +879,7 @@ flash_attn_mma_d128(
         for(int d=1;d<4;d<<=1){rmax_a=fmaxf(rmax_a,__shfl_xor_sync(0xffffffff,rmax_a,d));rmax_b=fmaxf(rmax_b,__shfl_xor_sync(0xffffffff,rmax_b,d));}
 
         float m_new_a=fmaxf(m_a,rmax_a),m_new_b=fmaxf(m_b,rmax_b);
-        float sc_a=__expf(m_a-m_new_a),sc_b=__expf(m_b-m_new_b);
+        float sc_a=exp2f(m_a-m_new_a),sc_b=exp2f(m_b-m_new_b);
         #pragma unroll
         for(int i=0;i<O_ACC;i+=4){o_acc[i]*=sc_a;o_acc[i+1]*=sc_a;o_acc[i+2]*=sc_b;o_acc[i+3]*=sc_b;}
         l_a*=sc_a;l_b*=sc_b;m_a=m_new_a;m_b=m_new_b;
@@ -887,10 +888,10 @@ flash_attn_mma_d128(
         #pragma unroll
         for(int n=0;n<QKT_N;n++){
             int si=n*4;
-            float p0=__expf(s_acc[si]-m_new_a);
-            float p1=__expf(s_acc[si+1]-m_new_a);
-            float p2=__expf(s_acc[si+2]-m_new_b);
-            float p3=__expf(s_acc[si+3]-m_new_b);
+            float p0=exp2f(s_acc[si]-m_new_a);
+            float p1=exp2f(s_acc[si+1]-m_new_a);
+            float p2=exp2f(s_acc[si+2]-m_new_b);
+            float p3=exp2f(s_acc[si+3]-m_new_b);
             lt_a+=p0+p1;lt_b+=p2+p3;s_acc[si]=p0;s_acc[si+1]=p1;s_acc[si+2]=p2;s_acc[si+3]=p3;
         }
         #pragma unroll
@@ -1096,7 +1097,7 @@ flash_attn_mma_d40(
         for (int d=1;d<4;d<<=1){rmax_a=fmaxf(rmax_a,__shfl_xor_sync(0xffffffff,rmax_a,d));rmax_b=fmaxf(rmax_b,__shfl_xor_sync(0xffffffff,rmax_b,d));}
 
         float m_new_a=fmaxf(m_a,rmax_a), m_new_b=fmaxf(m_b,rmax_b);
-        float sc_a=__expf(m_a-m_new_a), sc_b=__expf(m_b-m_new_b);
+        float sc_a=exp2f(m_a-m_new_a), sc_b=exp2f(m_b-m_new_b);
         #pragma unroll
         for(int i=0;i<O_ACC;i+=4){o_acc[i]*=sc_a;o_acc[i+1]*=sc_a;o_acc[i+2]*=sc_b;o_acc[i+3]*=sc_b;}
         l_a*=sc_a;l_b*=sc_b;m_a=m_new_a;m_b=m_new_b;
@@ -1104,10 +1105,10 @@ flash_attn_mma_d40(
         float lt_a=0,lt_b=0;
         #pragma unroll
         for(int n=0;n<N_TILES;n++){
-            float p0=__expf(s_acc[n*4]-m_new_a);
-            float p1=__expf(s_acc[n*4+1]-m_new_a);
-            float p2=__expf(s_acc[n*4+2]-m_new_b);
-            float p3=__expf(s_acc[n*4+3]-m_new_b);
+            float p0=exp2f(s_acc[n*4]-m_new_a);
+            float p1=exp2f(s_acc[n*4+1]-m_new_a);
+            float p2=exp2f(s_acc[n*4+2]-m_new_b);
+            float p3=exp2f(s_acc[n*4+3]-m_new_b);
             lt_a+=p0+p1;lt_b+=p2+p3;s_acc[n*4]=p0;s_acc[n*4+1]=p1;s_acc[n*4+2]=p2;s_acc[n*4+3]=p3;
         }
         #pragma unroll
@@ -1210,11 +1211,11 @@ flash_attn_scalar(
                 tm=fmaxf(tm,sc[j]);
             }
             float mn=fmaxf(mv,tm);
-            float s=(mv>-FLT_MAX)?expf(mv-mn):0.0f;
+            float s=(mv>-FLT_MAX)?exp2f(mv-mn):0.0f;
             lv*=s; for(int d=0;d<HEAD_DIM;d++) or_[d]*=s;
             float lt=0;
             for(int j=0;j<Bc;j++) {
-                float p=(sc[j]>-FLT_MAX)?expf(sc[j]-mn):0.0f;
+                float p=(sc[j]>-FLT_MAX)?exp2f(sc[j]-mn):0.0f;
                 lt+=p;
                 if(p>0) for(int d=0;d<HEAD_DIM;d++) or_[d]+=p*__bfloat162float(vt[j*KVS+d]);
             }
@@ -1241,7 +1242,8 @@ torch::Tensor flash_attn_forward(
     TORCH_CHECK(D==40||D==64||D==128, "head_dim 40/64/128");
 
     auto O = torch::zeros_like(Q);
-    float sc = 1.0f/sqrtf((float)D);
+    // Fold LOG2E into Q scale so softmax uses exp2 (1 instr) instead of exp (2 instr)
+    float sc = 1.0f/sqrtf((float)D) * 1.4426950408889634f;
     auto d = [&](){
         struct{const __nv_bfloat16*q,*k,*v;__nv_bfloat16*o;}r;
         r.q=reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr());
