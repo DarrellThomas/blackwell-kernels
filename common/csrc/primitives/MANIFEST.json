@@ -166,5 +166,26 @@
     "has_blas_interface": false,
     "shipped_at": 1774773583.9709723,
     "version": 1
+  },
+  "mla_attention/mla_attn_fwd_sm120.cu": {
+    "hash": "88aa76047be83dca",
+    "size": 37573,
+    "has_blas_interface": false,
+    "shipped_at": 1776881935.296368,
+    "version": 1
+  },
+  "mla_attention/mla_attn_bwd_sm120.cu": {
+    "hash": "8a655e01e9e855df",
+    "size": 60391,
+    "has_blas_interface": false,
+    "shipped_at": 1776881935.296368,
+    "version": 1
+  },
+  "mla_attention/mla_attention.py": {
+    "hash": "11e209bd7106b916",
+    "size": 2574,
+    "has_blas_interface": false,
+    "shipped_at": 1776881935.296368,
+    "version": 1
   }
 }
