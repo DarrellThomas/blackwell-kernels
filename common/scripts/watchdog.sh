@@ -77,17 +77,18 @@ LOOPS=(
     #   claude --dangerously-skip-permissions
     #   codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen
     # Format: name|tmux_session|legacy_results_tsv|resume_cmd|launch_cmd|cwd
-    # Claude workers disabled 2026-04-02 — API cost control (re-enable when budget allows)
-    # "gemm|gemm|$REPO_ROOT/gemm/results/gemm.tsv|@active-prompt:gemm|claude --dangerously-skip-permissions|$REPO_ROOT/gemm"
-    # "octave-gpu|octave-gpu||@active-prompt:octave-gpu|claude --dangerously-skip-permissions|$REPO_ROOT/octave-gpu"
-    "octave-gpu|octave-gpu||@active-prompt:octave-gpu|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/octave-gpu"
     #
-    # --- 4 Codex workers (each owns a distinct job so file conflicts are rare) ---
-    # cx1=dgetrs #50  cx2=dgesv #33  cx3=dnrm2 #31  cx4=dgels #52  (all in octave-gpu/)
-    "cx1|cx1||@active-prompt:cx1|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/octave-gpu"
-    "cx2|cx2||@active-prompt:cx2|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/octave-gpu"
-    "cx3|cx3||@active-prompt:cx3|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/octave-gpu"
-    "cx4|cx4||@active-prompt:cx4|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/octave-gpu"
+    # --- Active workers (2026-04-09) ---
+    "qv4|qv4||@active-prompt:qv4|claude --dangerously-skip-permissions|$REPO_ROOT/cuquantum"
+    "qv8|qv8||@active-prompt:qv8|claude --dangerously-skip-permissions|$REPO_ROOT/cuquantum"
+    "comfy_render|comfy_render||@active-prompt:comfy_render|claude --dangerously-skip-permissions|$REPO_ROOT/comfy_render"
+    #
+    # --- Previous workers (disabled 2026-04-09) ---
+    # "octave-gpu|octave-gpu||@active-prompt:octave-gpu|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/octave-gpu"
+    # "cx1|cx1||@active-prompt:cx1|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/octave-gpu"
+    # "cx2|cx2||@active-prompt:cx2|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/octave-gpu"
+    # "cx3|cx3||@active-prompt:cx3|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/octave-gpu"
+    # "cx4|cx4||@active-prompt:cx4|codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen|$REPO_ROOT/octave-gpu"
 
     # --- NEVER add this — chess-training is Darrell's live ML training, not a worker ---
     # chess-training: RNN training in progress, not a kernel optimization loop

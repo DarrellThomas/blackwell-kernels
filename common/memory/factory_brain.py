@@ -345,6 +345,10 @@ def resolve_job_project_dir(job) -> Optional[Path]:
 
     kernel = (job.get("kernel_type") or "").strip()
     if kernel:
+        # Prefer watchdog worktree over scaffold directory on main
+        watchdog = BWK_ROOT / "data" / "watchdog-worktrees" / kernel / "current" / kernel
+        if watchdog.is_dir():
+            return watchdog
         candidate = BWK_ROOT / kernel
         if candidate.is_dir():
             return candidate
@@ -393,7 +397,19 @@ def detect_worker_job_signal(mem, worker: str, job_id: int | None, worker_state:
             return signal
 
     task_signal = _normalize_worker_task_signal((worker_state or {}).get('current_task', ''))
-    return task_signal or 'none'
+    if not task_signal:
+        return 'none'
+    # If the task says "done" or "check my work" but there are no open messages
+    # with that signal, it's a stale heartbeat — ops already resolved it.
+    if task_signal in ('done', 'check_my_work') and not open_rows:
+        resolved = mem.get_messages(status='resolved', job_id=job_id, from_agent=worker)
+        has_resolved_signal = any(
+            _normalize_handoff_subject(r.get('subject') or '') == task_signal
+            for r in resolved
+        )
+        if has_resolved_signal:
+            return 'none'
+    return task_signal
 
 
 def get_active_worker_jobs(mem, worker: str, exclude_done_handoffs: bool = False) -> list[dict]:

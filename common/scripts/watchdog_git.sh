@@ -57,7 +57,7 @@ worker = sys.argv[1]
 fallback_cwd = sys.argv[2]
 terminal = {'shipped', 'converged', 'parked', 'abandoned'}
 mem = ResearchMemory()
-rows = get_active_worker_jobs(mem, worker, exclude_done_handoffs=True)
+rows = get_active_worker_jobs(mem, worker, exclude_done_handoffs=False)
 rows.sort(key=lambda j: (int(j['priority']) if str(j['priority']).isdigit() else 99, j['updated_at'], j['id']))
 job = rows[0] if rows else None
 project_dir = None
@@ -125,8 +125,8 @@ prepare_worker_workspace() {
                 printf '%s\n' "$worktree_path"
                 return 0
             fi
-            if git -C "$worktree_path" status --porcelain | grep -q .; then
-                log_watchdog attention "$worker" "dedicated worktree $worktree_path is dirty; refusing automatic reset"
+            if git -C "$worktree_path" status --porcelain | grep -v '^?? ' | grep -q .; then
+                log_watchdog attention "$worker" "dedicated worktree $worktree_path has modified tracked files; refusing automatic reset"
                 refresh_worker_packet "$worker" "$worktree_path" "$repo_top" "$current_branch" >/dev/null 2>&1 || true
                 printf '%s\n' "$worktree_path"
                 return 0
@@ -154,8 +154,8 @@ reset_worker_workspace() {
 
     if [[ -e "$worktree_path" ]]; then
         if git -C "$worktree_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-            if git -C "$worktree_path" status --porcelain | grep -q .; then
-                log_watchdog attention "$worker" "cannot reset dirty dedicated worktree $worktree_path"
+            if git -C "$worktree_path" status --porcelain | grep -v '^?? ' | grep -q .; then
+                log_watchdog attention "$worker" "cannot reset worktree with modified tracked files $worktree_path"
                 printf '%s\n' "$worktree_path"
                 return 1
             fi
