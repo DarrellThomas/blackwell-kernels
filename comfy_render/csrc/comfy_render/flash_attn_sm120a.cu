@@ -18,6 +18,7 @@
 namespace {
 
 constexpr int WARP_SIZE = 32;
+constexpr float LOG2E_F = 1.4426950408889634f;
 
 template <int STRIDE>
 __device__ __forceinline__ int swz(int row, int col) {
@@ -190,7 +191,7 @@ flash_attn_mma_d64(
         for (int d=1;d<4;d<<=1){rmax_a=fmaxf(rmax_a,__shfl_xor_sync(0xffffffff,rmax_a,d));rmax_b=fmaxf(rmax_b,__shfl_xor_sync(0xffffffff,rmax_b,d));}
 
         float m_new_a=fmaxf(m_a,rmax_a), m_new_b=fmaxf(m_b,rmax_b);
-        float sc_a=__expf(m_a-m_new_a), sc_b=__expf(m_b-m_new_b);
+        float sc_a=exp2f(m_a-m_new_a), sc_b=exp2f(m_b-m_new_b);
         #pragma unroll
         for(int i=0;i<ACC;i+=4){o_acc[i]*=sc_a;o_acc[i+1]*=sc_a;o_acc[i+2]*=sc_b;o_acc[i+3]*=sc_b;}
         l_a*=sc_a;l_b*=sc_b;m_a=m_new_a;m_b=m_new_b;
@@ -198,10 +199,10 @@ flash_attn_mma_d64(
         float lt_a=0,lt_b=0;
         #pragma unroll
         for(int n=0;n<N_TILES;n++){
-            float p0=__expf(s_acc[n*4]-m_new_a);
-            float p1=__expf(s_acc[n*4+1]-m_new_a);
-            float p2=__expf(s_acc[n*4+2]-m_new_b);
-            float p3=__expf(s_acc[n*4+3]-m_new_b);
+            float p0=exp2f(s_acc[n*4]-m_new_a);
+            float p1=exp2f(s_acc[n*4+1]-m_new_a);
+            float p2=exp2f(s_acc[n*4+2]-m_new_b);
+            float p3=exp2f(s_acc[n*4+3]-m_new_b);
             lt_a+=p0+p1;lt_b+=p2+p3;s_acc[n*4]=p0;s_acc[n*4+1]=p1;s_acc[n*4+2]=p2;s_acc[n*4+3]=p3;
         }
         #pragma unroll
@@ -1239,6 +1240,7 @@ torch::Tensor flash_attn_forward(
 
     auto O = torch::zeros_like(Q);
     float sc = 1.0f/sqrtf((float)D);
+    float sc_log2e = sc * LOG2E_F;
     auto d = [&](){
         struct{const __nv_bfloat16*q,*k,*v;__nv_bfloat16*o;}r;
         r.q=reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr());
@@ -1251,15 +1253,12 @@ torch::Tensor flash_attn_forward(
     constexpr int Br64=64, Br128=128, Bc=64;
 
     if(D==64){
-        constexpr int Bc128 = 128;
+        dim3 grid(B*H, (N+Br64-1)/Br64);
+        int sm = (Br64 + 2*Bc)*D*sizeof(__nv_bfloat16); // 24KB
         if (causal) {
-            dim3 grid(B*H, (N+Br64-1)/Br64);
-            int sm = (Br64 + 2*Bc)*D*sizeof(__nv_bfloat16); // 24KB
-            flash_attn_mma_d64<true><<<grid,128,sm>>>(d.q,d.k,d.v,d.o,N,sc);
+            flash_attn_mma_d64<true><<<grid,128,sm>>>(d.q,d.k,d.v,d.o,N,sc_log2e);
         } else {
-            dim3 grid(B*H, (N+Br64-1)/Br64);
-            int sm = (Bc128 + Bc128)*D*sizeof(__nv_bfloat16); // 32KB (V_buf + K_buf)
-            flash_attn_mma_d64_bc128<false><<<grid,128,sm>>>(d.q,d.k,d.v,d.o,N,sc);
+            flash_attn_mma_d64<false><<<grid,128,sm>>>(d.q,d.k,d.v,d.o,N,sc_log2e);
         }
     } else if(D==128){
         dim3 grid(B*H, (N+Br64-1)/Br64);
